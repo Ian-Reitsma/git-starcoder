@@ -1,0 +1,86 @@
+# Enhanced StarCoder Training Configuration (hardware-correct for RTX 2060 Super)
+#
+# This file intentionally avoids:
+# - FlashAttention-2 assumptions (RTX 2060 = Turing; FA2 targets Ampere+)
+# - Vocab resizing (keeps pretrained tokenizer/vocab)
+#
+# Goal: stability + maximum correctness on your system.
+
+model:
+  name: "starcoder-3b-hw-optimized"
+  pretrained_model: "bigcode/starcoder2-3b"
+
+  # Keep pretrained vocab/embeddings (do NOT override vocab_size here)
+  # Add a small number of special tokens only if tokenizer supports it.
+  add_special_tokens: true
+  extra_special_tokens_max: 64
+
+  # Attention backend: prefer PyTorch SDPA on Turing.
+  # If xFormers is installed, it can be enabled in the trainer.
+  attention_backend: "sdpa"   # choices: sdpa | xformers | flashattn_v1
+
+  # Memory
+  gradient_checkpointing: true
+  use_kv_cache: true
+
+quantization:
+  load_in_4bit: true
+  bnb_4bit_use_double_quant: true
+  bnb_4bit_quant_type: "nf4"
+  bnb_4bit_compute_dtype: "float16"
+
+  lora_enabled: true
+  lora_rank: 32
+  lora_alpha: 64
+  lora_dropout: 0.05
+  lora_target_modules: ["c_attn", "c_proj", "fc1", "fc2"]
+  lora_bias: "none"
+
+
+  train_path: "data_enhanced/dataset_enhanced/training_data_enhanced_train.json"
+  val_path: "data_enhanced/dataset_enhanced/training_data_enhanced_val.json"
+  test_path: "data_enhanced/dataset_enhanced/training_data_enhanced_test.json"
+
+  # Keep these aligned with what the dataset builder actually produced.
+  # You can raise these once the trainer supports longer contexts.
+  context_window: 2048
+  target_window: 256
+
+optimization:
+  # RTX 2060 Super 6GB VRAM-safe defaults
+  batch_size: 4
+  gradient_accumulation_steps: 8   # effective batch = 32
+
+  learning_rate: 2.0e-4
+  lr_scheduler: "cosine"
+  warmup_steps: 1000
+
+  optimizer: "adamw"
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+  mixed_precision: "fp16"
+  loss_scale: "dynamic"
+
+training:
+  num_epochs: 3
+  max_steps: 10000
+  save_steps: 500
+  save_total_limit: 3
+  eval_steps: 200
+  logging_steps: 100
+  seed: 42
+
+inference:
+  # For long-form generation, rely on iterative generation + compile-gated patching.
+  max_length: 4096
+  do_sample: true
+  top_p: 0.95
+  temperature: 0.7
+  num_beams: 1
+
+output:
+  output_dir: "models/the-block-enhanced-hw-optimized"
+  overwrite_output_dir: false
+  save_model: true
+  save_optimizer: false

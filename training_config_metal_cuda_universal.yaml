@@ -1,0 +1,93 @@
+# Universal Training Config: Works on macOS (Metal) + Linux (CUDA)
+#
+# This config auto-detects device and adapts settings accordingly.
+# No manual device selection needed—just run the same command on any platform.
+
+model:
+  name: "starcoder2-3b-hw-optimized"
+  pretrained_model: "bigcode/starcoder2-3b"
+  add_special_tokens: true
+  extra_special_tokens_max: 64
+  trust_remote_code: true
+  device_map: "auto"  # PyTorch will auto-route to Metal/CUDA
+
+  # Will be overridden by device backend
+  # On Metal: bf16/float32 (no fp16 support)
+  # On CUDA: auto (any dtype works)
+  torch_dtype: "auto"
+
+quantization:
+  load_in_4bit: true
+  bnb_4bit_use_double_quant: true
+  bnb_4bit_quant_type: "nf4"
+  bnb_4bit_compute_dtype: "float16"
+
+  lora_enabled: true
+  lora_rank: 32
+  lora_alpha: 64
+  lora_dropout: 0.05
+  lora_target_modules: ["c_attn", "c_proj", "fc1", "fc2"]
+  lora_bias: "none"
+
+
+  train_path: "data_enhanced/dataset_enhanced/training_data_enhanced_train.json"
+  val_path: "data_enhanced/dataset_enhanced/training_data_enhanced_val.json"
+  test_path: "data_enhanced/dataset_enhanced/training_data_enhanced_test.json"
+
+  context_window: 2048
+  target_window: 256
+
+optimization:
+  # Metal: use smaller batch size; CUDA: can use batch 4+
+  # Device backend will select based on platform
+  batch_size: 2  # Safe default for both
+  gradient_accumulation_steps: 8  # effective batch = 16
+
+  learning_rate: 2.0e-4
+  lr_scheduler: "cosine"
+  warmup_steps: 1000
+
+  optimizer: "adamw"
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+  mixed_precision: "bf16"  # Supported on both Metal + CUDA
+  use_mixed_precision: true
+
+  # Metal: disable (can cause issues)
+  # CUDA: enable (improves memory efficiency)
+  # Device backend will override this
+  gradient_checkpointing: true
+
+training:
+  num_epochs: 3
+  max_steps: 10000
+  save_steps: 500
+  save_total_limit: 3
+  eval_steps: 200
+  logging_steps: 100
+  seed: 42
+
+inference:
+  # Long-form codegen relies on iterative generation + compile-gated patching
+  max_length: 4096
+  do_sample: true
+  top_p: 0.95
+  temperature: 0.7
+  num_beams: 1
+
+device_backend:
+  # Auto-detect platform; can override with explicit device
+  force_device: null  # null = auto-detect ("cuda", "mps", or "cpu")
+  
+  # Attention backend will be auto-selected:
+  # - macOS (Metal): "metal" (with FlashAttention if available)
+  # - Linux (CUDA, Turing): "sdpa"
+  # - Linux (CUDA, Ampere+): "xformers"
+  attention_backend: "auto"
+
+output:
+  output_dir: "models/the-block-enhanced-metal-cuda"
+  overwrite_output_dir: false
+  save_model: true
+  save_optimizer: false

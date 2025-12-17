@@ -1,0 +1,193 @@
+# Training Configuration - Now with Model Flexibility
+# Supports GPT2, StarCoder2-3B, Phi-2, and other causal LM models
+# Switch models by changing model.name and re-running
+
+model:
+  # Model selection: Choose between multiple base models
+  # Options:
+  #   - gpt2                                (original, lowest VRAM, basic)
+  #   - gpt2-medium                         (medium size, original default)
+  #   - bigcode/starcoder2-3b               (RECOMMENDED: code-specialized, 3B)
+  #   - microsoft/phi-2                     (alternative: reasoning + code)
+  name: bigcode/starcoder2-3b
+  
+  # Tokenizer (usually same as model name)
+  tokenizer_name: bigcode/starcoder2-3b
+  
+  # Trust remote code (required for some models like StarCoder2)
+  trust_remote_code: true
+  
+  # Quantization settings for large models
+  # 4-bit is most aggressive (smallest VRAM), 8-bit is middle ground
+  # For StarCoder2-3B on 6GB GPU: use 4-bit or 8-bit
+  use_4bit: true              # Load model in 4-bit (8.6B params with quantization fits ~6GB)
+  use_8bit: false             # Alternative: 8-bit (slightly larger but faster)
+  use_bf16: true              # Use bfloat16 for computation (better numerical stability than fp16)
+  
+  # LoRA (Parameter-Efficient Fine-Tuning) settings
+  # LoRA trains only low-rank adapters, keeping base model frozen
+  # Essential for fitting 3B models on 6GB GPU
+  use_lora: true
+  
+  lora:
+    # Rank and alpha control the "capacity" of the LoRA adapter
+    # Higher rank = more trainable params but more VRAM, slower
+    # For code learning, rank 8-16 is standard
+    r: 8                        # LoRA rank (8 = ~0.1% extra trainable params)
+    lora_alpha: 16              # Scaling factor (2x rank is typical)
+    target_modules: ["c_attn", "c_proj"]  # Which modules to apply LoRA to
+                                           # For GPT2: c_attn, c_proj
+                                           # For StarCoder2/others: may need adjustment
+    lora_dropout: 0.05          # Dropout in LoRA modules (prevent overfitting)
+    bias: "none"                # Don't train bias terms in LoRA
+  
+  # Model context and output settings
+  max_position_embeddings: 1024           # Input sequence length
+  max_new_tokens: 256                     # Generation length
+  vocab_size_override: null               # Leave null, auto-detect
+
+training:
+  # Base learning rate (will scale with batch size)
+  # For LoRA fine-tuning, slightly higher than full fine-tune is OK
+  base_learning_rate: 1e-4  # Was 5e-5, increased for LoRA (only updating ~0.1% of params)
+  
+  # Warmup settings (now properly proportional to dataset size)
+  warmup_ratio: 0.1
+  warmup_steps_min: 10
+  warmup_steps_max: 100
+  
+  # Weight decay (L2 regularization)
+  weight_decay: 0.01
+  
+  # Batch size (auto-adjusted based on GPU memory)
+  batch_size_reference: 8
+  batch_size_large: 4
+  batch_size_medium: 2
+  batch_size_small: 1
+  
+  # Data loading optimization
+  num_workers: 4
+  num_workers_min: 1
+  num_workers_max: 8
+  pin_memory: true
+  
+  # Gradient accumulation (simulate larger batch without OOM)
+  gradient_accumulation_steps: 2
+  
+  # Gradient clipping (prevent exploding gradients in LoRA fine-tune)
+  max_grad_norm: 1.0
+  
+  # Mixed precision training (memory + speed)
+  use_mixed_precision: false               # Enable fp16 or bf16 autocast
+  autocast_dtype: "bfloat16"              # bf16 is more stable than fp16
+  
+  # Gradient checkpointing (trade compute for memory)
+  use_gradient_checkpointing: true        # Reduce activation memory (helpful with LoRA)
+  
+  # Train/validation split
+  validation_split: 0.1
+  
+  # Early stopping
+  patience: 3
+  min_delta: 0.0001
+  
+  # Determinism
+  seed: 42
+
+epoch_calculation:
+  # Target total tokens for training
+  target_tokens: 20000000
+  
+  # Epoch bounds
+  min_epochs: 3
+  max_epochs: 10
+  
+  # Override warmup
+  override_min_warmup: true
+  
+  # Fallback epochs for tiny datasets
+  min_sequences_threshold: 5
+  fallback_epochs_tiny: 10
+  fallback_epochs_small: 8
+  fallback_epochs_medium: 6
+  fallback_epochs_large: 5
+  fallback_epochs_huge: 4
+
+hardware_monitoring:
+  # Sampling interval (seconds)
+  collection_interval_seconds: 5
+  
+  # GPU memory thresholds (adjusted for modern GPUs like RTX 2060)
+  gpu_memory_threshold_large_gb: 7.0
+  gpu_memory_threshold_medium_gb: 4.0
+  gpu_memory_threshold_small_gb: 2.0
+
+logging:
+  # Which metrics to track
+  track_loss_history: true
+  track_grad_norms: true
+  track_lr_schedule: true
+  track_hardware: true
+  track_per_step_metrics: false
+  
+  # What to include in final report
+  include_loss_history: true
+  include_min_max_stats: true
+  include_hardware_peak: true
+  include_epoch_summary: true
+  
+  # New metrics for LoRA fine-tuning
+  track_overfitting_gap: true             # Track train-val loss divergence
+  track_adapter_params: true              # Log LoRA param counts
+  include_model_info: true                # Include base model, LoRA config in manifest
+
+evaluation:
+  # Code-specific behavioral evaluation
+  run_behavioral_eval: true               # Run qualitative tests during training
+  eval_every_n_epochs: 1                  # After each epoch
+  
+  # Behavioral test prompts (examples from your repo's patterns)
+  # These are run as "generation" tests to see if model learned code style
+  behavioral_test_prompts:
+    - "def analyze_"
+    - "class Energy"
+    - "@dataclass\nclass"
+    - "async def"
+    - "import"
+  
+  eval_max_length: 100
+  eval_num_return_sequences: 1
+  eval_temperature: 0.7
+  eval_top_p: 0.95
+
+model_saving:
+  # Save checkpoints and final model
+  save_final_model: true
+  save_best_model: true                   # Save the best validation checkpoint
+  save_ckpt_every_n_epochs: 1            # Checkpoint frequency
+  
+  # For LoRA models, can save adapter-only (much smaller) or merged
+  save_adapter_only: false                # false = save merged model (larger but standalone)
+                                          # true = save only LoRA weights (tiny, needs base model)
+  
+  output_dir: models/the-block-git-model-final
+
+# Advanced: Control over data and curriculum
+
+  # Curriculum learning: over/under-sample based on commit metadata
+  use_curriculum: true
+  
+  # Weighting strategy
+  weight_by_recency: true                 # Recent commits weighted more
+  weight_by_directory: false              # Don't favor specific dirs for now
+  weight_by_author: false                 # Don't favor specific authors
+  
+  # Pack multiple small commits into sequence?
+  pack_sequences: false                   # false = 1 commit per sequence
+                                          # true = pack small commits, maintain order
+
+# Output configuration
+output:
+  manifest_file: MANIFEST_DYNAMIC.json
+  report_file: training_report.json
+  include_generated_samples: true         # Include sample generations in report

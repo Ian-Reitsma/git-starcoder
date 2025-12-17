@@ -1,0 +1,227 @@
+# Git Scrape + Tokenization + Training Configuration
+# All paths are relative to this config file's directory
+
+repository:
+  # Path to The Block repository
+  path: ~/home/Ian/llm/1/projects/the-block
+  
+  # Extract all branches
+  include_all_branches: true
+  
+  # Include merge commits
+  include_merges: true
+  
+  # Extract full diffs
+  extract_diffs: true
+
+# Git Scraper Configuration
+git_scraper:
+  enabled: true
+  output_file: outputs/commits.json
+  
+  # Include only these file types (empty = all)
+  file_filters:
+    - .rs      # Rust source
+    - .toml    # Config
+    - .md      # Docs
+  
+  # Statistics to compute
+  compute_stats: true
+
+# Semantic Chunking Configuration
+semantic_chunker:
+  enabled: true
+  input_file: outputs/commits.json
+  output_file: outputs/chunks.jsonl
+  
+  # Chunk by these semantic units
+  chunk_by:
+    - function      # Split by function boundaries
+    - module        # Split by module structure
+    - test          # Separate test code
+  
+  # Chunk size constraints (in tokens, approximate)
+  min_chunk_size: 50
+  max_chunk_size: 1024
+  
+  # Preserve context around chunks
+  preserve_context: true
+  context_lines: 3
+
+# Tokenization Configuration
+tokenization:
+  enabled: true
+  input_file: outputs/chunks.jsonl
+  
+  # Vocabulary settings
+  vocab_size: 50257      # Similar to GPT-2
+  vocab_output: outputs/vocab.json
+  tokens_output: outputs/tokens.pt
+  
+  # Special tokens (will be reserved)
+  special_tokens:
+    - <PAD>
+    - <UNK>
+    - <COMMIT_START>
+    - <COMMIT_END>
+    - <FILE_START>
+    - <FILE_END>
+    - <CODE_START>
+    - <CODE_END>
+    - <TEST_START>
+    - <TEST_END>
+  
+  # Rust-specific tokens to preserve
+  language_specific:
+    rust:
+      keywords:
+        - fn
+        - struct
+        - impl
+        - trait
+        - enum
+        - pub
+        - async
+      macros:
+        - println!
+        - panic!
+        - vec!
+        - assert!
+
+# Dataset Building Configuration
+dataset_builder:
+  enabled: true
+  
+  input_vocab: outputs/vocab.json
+  input_chunks: outputs/chunks.jsonl
+  input_commits: outputs/commits.json
+  output_dir: outputs/
+  
+  # Context window for training
+  context_window: 2048
+  target_window: 256
+  
+  # Data split ratios (must sum to 1.0)
+  data_splits:
+    train: 0.70
+    validation: 0.15
+    test: 0.15
+  
+  # Stride for creating overlapping examples
+  stride: 128
+  
+  # Output format: 'pytorch' or 'numpy'
+  output_format: pytorch
+
+# Model Training Configuration
+model_training:
+  enabled: true
+  
+  # Base model to fine-tune
+  base_model: llama2-7b        # Change to llama2-70b if you have VRAM
+  quantization: Q4_K_M          # 4-bit quantization
+  
+  # Training parameters
+  epochs: 3
+  batch_size: 4                 # Adjust based on VRAM
+  learning_rate: 5.0e-5
+  warmup_steps: 500
+  max_grad_norm: 1.0
+  weight_decay: 0.01
+  
+  # Optimization
+  optimizer: adamw
+  scheduler: cosine
+  
+  # Hardware
+  use_gpu: true
+  gpu_layers: 30               # For VRAM-constrained systems
+  
+  # Checkpointing
+  save_checkpoint_every: 100
+  save_best_only: true
+  
+  # Output
+  output_model: outputs/model_weights.pt
+  output_logs: outputs/training_logs/
+
+# Logging Configuration
+logging:
+  level: INFO
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  log_file: outputs/pipeline.log
+
+# Pipeline Execution
+pipeline:
+  # Run all stages
+  run_all: true
+  
+  # Or run specific stages (if run_all: false)
+  stages:
+    - git_scraper
+    - semantic_chunker
+    - tokenization
+    - dataset_builder
+    - model_training
+  
+  # Continue on error
+  continue_on_error: false
+  
+  # Skip stages (useful for debugging)
+  skip_stages: []
+  
+  # Verbose output
+  verbose: true
+
+# Performance Tuning
+performance:
+  # Number of workers for parallel processing
+  num_workers: 4
+  
+  # Batch processing in scraper
+  scraper_batch_size: 50
+  
+  # Cache git operations
+  cache_git_ops: true
+  
+  # Memory management
+  gc_interval: 100  # Run garbage collection every N items
+
+# Output Configuration
+output:
+  # Create these directories if they don't exist
+  directories:
+    - outputs/
+    - outputs/training_logs/
+    - outputs/checkpoints/
+  
+  # Generate reports
+  generate_reports: true
+  report_dir: outputs/reports/
+  
+  # Save intermediate results
+  save_intermediate: true
+  
+  # Compression for large files
+  compress_output: false  # Set to gzip if storage is limited
+
+# Advanced Options
+advanced:
+  # Use incremental processing for large repos
+  incremental_mode: false
+  
+  # Resume from checkpoint
+  resume_from_checkpoint: null
+  
+  # Validation frequency
+  validation_frequency: 50
+  
+  # Early stopping patience
+  early_stopping_patience: 5
+  
+  # Mixed precision training
+  mixed_precision: false
+  
+  # Distributed training (for multi-GPU)
+  distributed: false
+  num_gpus: 1

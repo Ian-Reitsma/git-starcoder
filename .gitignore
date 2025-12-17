@@ -1,0 +1,78 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Virtualenvs / env
+venv/
+.venv/
+env/
+ENV/
+
+# Editor/IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Logs / runtime outputs
+*.log
+*.debug
+logs/
+
+# Training artifacts / checkpoints
+runs/
+wandb/
+tensorboard/
+checkpoints/
+**/checkpoint-*/
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Large local datasets / generated corpora
+# Keep optional docs under data/ by unignoring README.md
+/data/**
+!/data/README.md
+!/data/**/README.md
+
+# Local model outputs
+/models/**
+!/models/README.md
+!/models/**/README.md
+
+# Local embeddings / vector db dumps
+/embeddings/qdrant_*.json
+/embeddings/*.json
+
+# OS / temp
+.tmp/
+*.tmp
+*.swp
+
+# Build artifacts (if/when you add native extensions)
+build/
+dist/
+*.egg-info/
+
+# Secrets (prevent accidental commits)
+.env
+.env.*
+*.key
+*.pem
+*.p12
+
+# Jupyter
+.ipynb_checkpoints/

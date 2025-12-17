@@ -1,0 +1,161 @@
+# Training Configuration - LONG-CONTEXT OPTIMIZATION FOR 8GB MAC
+# Targets: maximum context window within hardware constraints
+# Philosophy: Time is unlimited; optimize for model quality & effective context
+
+model:
+  name: bigcode/starcoder2-3b
+  tokenizer_name: bigcode/starcoder2-3b
+  trust_remote_code: true
+  
+  # Hardware profiling for 8GB Mac
+  # Max sustainable: ~3B model + LoRA + 4-bit quantization
+  # This leaves ~5GB for training (activations, gradients, batch)
+  use_4bit: true
+  use_8bit: false
+  use_bf16: true
+  
+  # LoRA for long-context adaptation without full retraining
+  use_lora: true
+  lora:
+    # Increased rank (from 16 → 32) for long-context patterns
+    # Long-range dependencies need more capacity in LoRA
+    r: 32
+    lora_alpha: 64
+    
+    # Target key modules for long-context: attention (queries/keys/values) + MLP
+    target_modules: ["c_attn", "c_proj", "c_fc"]
+    lora_dropout: 0.05
+    bias: "none"
+  
+  # LONG-CONTEXT STRATEGY:
+  # Phase 1: Start with max_position_embeddings=2048 (safe for 8GB with careful batching)
+  # Phase 2: Extend to 4096 with streaming/windowed attention
+  # Phase 3: Experimental 6144 if memory allows (gradient checkpointing + reduced batch)
+  max_position_embeddings: 2048  # START HERE (1024→2048 tokens per sequence)
+  
+  # Allow context window extension at inference for trained models
+  max_new_tokens: 1024  # Can generate longer from extended context
+  
+  vocab_size_override: null
+
+training:
+  # PHASE-BASED LEARNING STRATEGY
+  # 
+  # Phase 1 (Epochs 1-5): General adaptation
+  #   - Mixed sequence lengths (512–2048 tokens)
+  #   - Higher LR to establish base patterns
+  #   - Standard attention
+  #
+  # Phase 2 (Epochs 6-12): Long-context specialization
+  #   - Predominantly 1536–2048 token sequences
+  #   - Lower LR for fine-tuning long-range dependencies
+  #   - Curriculum emphasis on multi-file, hierarchical spans
+  #
+  # Phase 3 (Epochs 13-20): Extended context (if memory allows)
+  #   - Attempted 3072–4096 token sequences
+  #   - Very low LR (10x reduction from Phase 1)
+  #   - Extreme gradient accumulation
+  
+  base_learning_rate: 5e-5  # Reduced from 1e-4 (long-context benefits from stable LR)
+  
+  # Learning rate schedule optimized for multi-phase
+  warmup_ratio: 0.15  # Increased from 0.1 (longer warmup for stability at long context)
+  warmup_steps_min: 20
+  warmup_steps_max: 2000  # Much higher warmup budget
+  
+  weight_decay: 0.01
+  
+  # Batch sizing: aggressive reduction to fit 2K-token sequences
+  # With 8GB total, 4-bit 3B model (~0.75GB), LoRA state (~0.2GB)
+  # Leaves ~6GB for training; at 2K tokens, effective batch after accumulation ~8–16
+  batch_size_reference: 1    # Per-GPU batch = 1 for 2K sequences
+  batch_size_large: 1
+  batch_size_medium: 1
+  batch_size_small: 1
+  
+  # Data loading
+  num_workers: 2
+  num_workers_min: 1
+  num_workers_max: 4
+  pin_memory: true
+  
+  # GRADIENT ACCUMULATION FOR EFFECTIVE BATCH SIZE
+  # With per-GPU batch=1, accumulate over 16 steps → effective batch size 16
+  # This mimics training on larger batches without the memory overhead
+  gradient_accumulation_steps: 16
+  
+  # Keep context from previous sequences during training
+  # For long-context, this is valuable: models learn to attend across sequence boundaries
+  incremental_context_sequences: 3
+  
+  # Gradient clipping
+  max_grad_norm: 1.0
+  
+  # Mixed precision (bfloat16) reduces memory 2x
+  use_mixed_precision: true
+  autocast_dtype: "bfloat16"
+  
+  # CRITICAL: Gradient checkpointing for 2K-token sequences
+  # Trades compute for memory: recompute activations instead of storing them
+  # Allows ~2x larger sequences with same memory
+  use_gradient_checkpointing: true
+  
+  # Train/validation split
+  validation_split: 0.15
+  
+  # Early stopping (generous for long-context learning)
+  patience: 8  # Increased from 5 (long-context improves more slowly)
+  min_delta: 0.00001  # Tighter convergence threshold
+  lr_plateau_patience: 5
+  lr_reduction_factor: 0.5
+  
+  # Reproducibility
+  seed: 42
+  
+  # CURRICULUM LEARNING FOR LONG CONTEXT
+  # Build sequences hierarchically: file → multi-file → cross-commit spans
+  curriculum_strategy: "hierarchical_long_context"
+  
+  # Long-context specific settings
+  long_context:
+    # Phase 1: mixed lengths (512–1024)
+    phase1_max_length: 1024
+    phase1_epochs: 5
+    
+    # Phase 2: long sequences (1536–2048)
+    phase2_min_length: 1536
+    phase2_max_length: 2048
+    phase2_epochs: 8
+    phase2_lr_multiplier: 0.5  # 50% of base_learning_rate
+    
+    # Phase 3: extended (3072–4096 if memory permits)
+    phase3_min_length: 3072
+    phase3_max_length: 4096
+    phase3_epochs: 8
+    phase3_lr_multiplier: 0.1  # 10% of base_learning_rate
+    phase3_enabled: false  # Enable only if Phase 2 shows stable convergence
+
+epoch_calculation:
+  # Token-based epoch sizing (not just commit count)
+  target_tokens: 50000000  # 50M tokens; at 2K avg = 25K sequences
+  min_epochs: 15  # At least 15 passes for long-context specialization
+  max_epochs: 30  # Maximum 30 passes (prevents overfitting rare patterns)
+
+hardware_monitoring:
+  # Aggressive monitoring for long-context training
+  # Catch OOM before it crashes
+  enabled: true
+  interval_seconds: 10
+  log_peaks: true
+  memory_threshold_warn_pct: 85   # Warn at 85% VRAM
+  memory_threshold_stop_pct: 95   # Emergency stop at 95% VRAM
+
+logging:
+  level: "INFO"
+  log_interval: 10  # Log every 10 steps (fewer per-step logs for long sequences)
+  save_interval: 500  # Checkpoint every 500 steps
+  
+  # Long-context specific metrics
+  track_attention_patterns: true
+  track_position_bias: true  # Monitor if model biases certain positions
+  track_gradient_flow: true  # Ensure gradients reach early layers (important for long-range)
