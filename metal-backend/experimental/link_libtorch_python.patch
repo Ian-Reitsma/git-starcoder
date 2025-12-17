@@ -1,0 +1,24 @@
+diff --git a/orchard_ops/CMakeLists.txt b/orchard_ops/CMakeLists.txt
+@@
+ find_package(Python3 COMPONENTS Development REQUIRED)
++# ------------------------------------------------------------------
++# libtorch_python hosts the pybind11<->Tensor specialisations that
++# the undefined symbols are coming from.  Pull it from the same
++# directory libtorch.dylib lives in and link it explicitly.
++# ------------------------------------------------------------------
++find_library(TORCH_PYTHON_LIBRARY
++             NAMES torch_python
++             PATHS "${TORCH_LIBRARY_DIRS}"         # set by TorchConfig
++             NO_DEFAULT_PATH)
++if(NOT TORCH_PYTHON_LIBRARY)
++  message(FATAL_ERROR "libtorch_python.dylib not found – cannot link")
++endif()
+@@
+ target_link_libraries(flash_attn PRIVATE
+     ${TORCH_LIBRARIES}
++    ${TORCH_PYTHON_LIBRARY}
+     ${Python3_LIBRARIES})
+ EOF
+
+git apply --3way link_libtorch_python.patch
+

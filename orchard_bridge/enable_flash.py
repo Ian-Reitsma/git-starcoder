@@ -26,28 +26,53 @@ logger = logging.getLogger(__name__)
 
 
 def _find_orchard_dylib():
-    """Find libflash_attn.dylib from Apple-Metal-Orchard if available.
-    
-    Search order:
-    1. Explicit ORCHARD_DYLIB_PATH env var
-    2. Standard Orchard experimental path
-    3. Return None if not found
+    """Find libflash_attn.dylib.
+
+    Public-repo safe search order:
+    1. ORCHARD_DYLIB_PATH env var (explicit file)
+    2. ORCHARD_REPO_PATH env var (repo root containing experimental/)
+    3. REPO_ROOT / STARCODER_REPO_ROOT env var (git-starcoder repo root)
+    4. Repo-relative default: <git-starcoder>/metal-backend/experimental/...
+
+    Returns:
+        str | None: path to dylib
     """
-    # Explicit override
-    if os.environ.get("ORCHARD_DYLIB_PATH"):
-        return os.environ["ORCHARD_DYLIB_PATH"]
-    
-    # Standard Orchard path
-    orchard_base = os.path.expanduser("~/projects/Apple-Metal-Orchard")
-    dylib_path = os.path.join(
-        orchard_base,
-        "experimental/kernel_lib/flashattn/libflash_attn.dylib"
-    )
-    
-    if os.path.exists(dylib_path):
-        return dylib_path
-    
+    # 1) Explicit override
+    p = os.environ.get("ORCHARD_DYLIB_PATH")
+    if p:
+        return p
+
+    # Helper: check a candidate repo root
+    def _candidate(repo_root: Path) -> str | None:
+        dylib = repo_root / "experimental" / "kernel_lib" / "flashattn" / "libflash_attn.dylib"
+        return str(dylib) if dylib.exists() else None
+
+    # 2) Explicit Orchard repo root
+    repo_env = os.environ.get("ORCHARD_REPO_PATH")
+    if repo_env:
+        hit = _candidate(Path(repo_env).expanduser().resolve())
+        if hit:
+            return hit
+
+    # 3) git-starcoder repo root
+    star_root = os.environ.get("REPO_ROOT") or os.environ.get("STARCODER_REPO_ROOT")
+    if star_root:
+        mb = Path(star_root).expanduser().resolve() / "metal-backend"
+        hit = _candidate(mb)
+        if hit:
+            return hit
+
+    # 4) Repo-relative default from this file location
+    # enable_flash.py is <git-starcoder>/orchard_bridge/enable_flash.py
+    # so git root is parent of orchard_bridge.
+    git_root = Path(__file__).resolve().parent.parent
+    mb = git_root / "metal-backend"
+    hit = _candidate(mb)
+    if hit:
+        return hit
+
     return None
+
 
 
 def main(verbose: bool = False, strict: bool = False):
@@ -94,7 +119,8 @@ def main(verbose: bool = False, strict: bool = False):
         if lib_path is None:
             msg = (
                 "libflash_attn.dylib not found. "
-                "Set ORCHARD_DYLIB_PATH or ensure Apple-Metal-Orchard is checked out at ~/projects/Apple-Metal-Orchard"
+                "Set ORCHARD_DYLIB_PATH (file) or ORCHARD_REPO_PATH (repo root), "
+                "or place Apple-Metal-Orchard at <repo>/metal-backend."
             )
             logger.warning(f"[starcoder-orchard] {msg}")
             if strict:

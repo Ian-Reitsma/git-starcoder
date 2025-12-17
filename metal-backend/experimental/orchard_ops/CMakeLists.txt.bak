@@ -1,0 +1,19 @@
+add_library(flash_attn SHARED
+    mps/flash_attn.mm
+)
+find_package(Torch REQUIRED)
+target_include_directories(flash_attn PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/mps
+    ${TORCH_INCLUDE_DIRS}
+)
+target_link_libraries(flash_attn PRIVATE ${TORCH_LIBRARIES})
+set_target_properties(flash_attn PROPERTIES
+    PREFIX "" OUTPUT_NAME "_flash_attn"
+)
+
+# enforce the same standard on the Obj-C++ translation unit
+target_compile_features(flash_attn PRIVATE cxx_std_20)
+set_property(TARGET flash_attn PROPERTY OBJCXX_STANDARD 20)
+find_package(Python3 COMPONENTS Development REQUIRED)
+target_include_directories(flash_attn PRIVATE ${Python3_INCLUDE_DIRS})
+target_link_libraries(flash_attn PRIVATE ${Python3_LIBRARIES})
