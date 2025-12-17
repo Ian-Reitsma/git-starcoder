@@ -16,6 +16,7 @@ import logging
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 try:
     import torch
@@ -35,7 +36,7 @@ def _find_orchard_dylib():
     4. Repo-relative default: <git-starcoder>/metal-backend/experimental/...
 
     Returns:
-        str | None: path to dylib
+        Optional[str]: path to dylib
     """
     # 1) Explicit override
     p = os.environ.get("ORCHARD_DYLIB_PATH")
@@ -43,7 +44,7 @@ def _find_orchard_dylib():
         return p
 
     # Helper: check a candidate repo root
-    def _candidate(repo_root: Path) -> str | None:
+    def _candidate(repo_root: Path) -> Optional[str]:
         dylib = repo_root / "experimental" / "kernel_lib" / "flashattn" / "libflash_attn.dylib"
         return str(dylib) if dylib.exists() else None
 
