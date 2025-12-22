@@ -1,104 +1,50 @@
-# Training Configuration - RUST OPTIMIZED
-# Specifically tuned for Rust codebases like The Block
-# StarCoder2-3B with longer context and Rust-specific settings
-
 model:
-  # StarCoder2-3B is PERFECT for Rust
-  # Trained on GitHub Rust repositories + standard library + common crates
   name: bigcode/starcoder2-3b
   tokenizer_name: bigcode/starcoder2-3b
   trust_remote_code: true
-  
-  # Quantization (fits 3B model on 6GB GPU)
   use_4bit: true
   use_8bit: false
   use_bf16: true
-  
-  # LoRA fine-tuning
   use_lora: true
-  
   lora:
-    # RUST OPTIMIZATION: Higher rank for more Rust idioms
-    r: 16                        # Was 8, now 16 (2x capacity)
-    lora_alpha: 32               # Was 16, now 32 (2x rank)
-    
-    # RUST OPTIMIZATION: Target more modules
-    target_modules: ["c_attn", "c_proj", "c_fc"]  # Added c_fc (MLP)
-    
+    r: 16
+    lora_alpha: 32
+    target_modules:
+    - c_attn
+    - c_proj
+    - c_fc
     lora_dropout: 0.05
-    bias: "none"
-  
-  # RUST OPTIMIZATION: Longer context for verbose Rust code
-  # Rust functions have:
-  # - Long type signatures
-  # - Explicit error handling (Result, unwrap, expect)
-  # - Trait bounds and where clauses
-  # - Lifetime annotations
-  # Default 2048 is too short for typical Rust modules
-  max_position_embeddings: 4096   # Was 2048, now 4096 (2x)
-  
-  # RUST OPTIMIZATION: Longer generation for complete functions
-  max_new_tokens: 512             # Was 256, now 512
-  
+    bias: none
+  max_position_embeddings: 4096
+  max_new_tokens: 512
   vocab_size_override: null
-
 training:
-  # RUST OPTIMIZATION: Higher LR for structured syntax
-  # Rust's strict compiler enforces consistent style
-  # LoRA can learn Rust idioms faster than dynamic languages
-  base_learning_rate: 2e-4        # Was 1e-4, now 2e-4
-  
-  # Warmup (same proportions)
+  base_learning_rate: 2e-4
   warmup_ratio: 0.1
   warmup_steps_min: 10
   warmup_steps_max: 1000
-  
   weight_decay: 0.01
-  
-  # RUST OPTIMIZATION: Smaller batches for longer sequences
-  # 4K token sequences need more VRAM than 2K
-  batch_size_reference: 4         # Was 8, now 4
-  batch_size_large: 4             # Was 8, now 4
-  batch_size_medium: 2            # Was 4, now 2
-  batch_size_small: 1             # Was 2, now 1
-  
-  # Data loading
+  batch_size_reference: 4
+  batch_size_large: 4
+  batch_size_medium: 2
+  batch_size_small: 1
   num_workers: 4
   num_workers_min: 1
   num_workers_max: 8
   pin_memory: true
-  
-  # RUST OPTIMIZATION: Higher accumulation for longer sequences
-  gradient_accumulation_steps: 4  # Was 2, now 4 (effective batch = 16)
-  
-  # Gradient clipping
+  gradient_accumulation_steps: 4
   max_grad_norm: 1.0
-  
-  # Mixed precision
   use_mixed_precision: true
-  autocast_dtype: "bfloat16"
-  
-  # Gradient checkpointing (critical with 4K sequences)
+  autocast_dtype: bfloat16
   use_gradient_checkpointing: true
-  
-  # Train/validation split
   validation_split: 0.1
-  
-  # Early stopping
   patience: 3
   min_delta: 0.0001
-  
-  # Reproducibility
   seed: 42
-
 epoch_calculation:
-  # Same target tokens
   target_tokens: 20000000
-  
-  # Epoch bounds
   min_epochs: 3
   max_epochs: 10
-  
   override_min_warmup: true
   min_sequences_threshold: 5
   fallback_epochs_tiny: 10
@@ -106,13 +52,11 @@ epoch_calculation:
   fallback_epochs_medium: 6
   fallback_epochs_large: 5
   fallback_epochs_huge: 4
-
 hardware_monitoring:
   collection_interval_seconds: 5
   gpu_memory_threshold_large_gb: 7.0
   gpu_memory_threshold_medium_gb: 4.0
   gpu_memory_threshold_small_gb: 2.0
-
 logging:
   track_loss_history: true
   track_grad_norms: true
@@ -126,142 +70,83 @@ logging:
   track_overfitting_gap: true
   track_adapter_params: true
   include_model_info: true
-
 evaluation:
-  # RUST OPTIMIZATION: Rust-specific behavioral tests
   run_behavioral_eval: true
   eval_every_n_epochs: 1
-  
-  # RUST-SPECIFIC TEST PROMPTS
-  # These test if the model learned Rust patterns
   behavioral_test_prompts:
-    # Core Rust syntax
-    - "fn process"                    # Function definition
-    - "impl"                           # Trait/struct implementation
-    - "pub struct"                     # Public struct
-    - "pub enum"                       # Public enum
-    - "async fn"                       # Async function
-    - "#[derive("                      # Derive macro
-    - "match"                          # Pattern matching
-    - "Result<"                        # Result type
-    - "Option<"                        # Option type
-    - "fn new() -> Self"               # Constructor
-    - "where\n    T:"                    # Where clause
-    - "Box<dyn"                        # Trait object
-    - "Arc<Mutex<"                     # Thread-safe shared state
-    
-    # Rust imports and modules
-    - "use std::"                      # Standard library import
-    - "use crate::"                    # Local crate import
-    - "mod"                            # Module definition
-    - "pub mod"                        # Public module
-    
-    # Error handling
-    - "impl Error for"                 # Error trait
-    - ".map_err("                      # Error mapping
-    - "?"                              # Try operator
-    
-    # Testing
-    - "#[cfg(test)]"                   # Test configuration
-    - "mod tests {"                    # Test module
-    - "#[test]"                        # Test function
-    - "assert_eq!("                    # Assertion
-    
-    # Block-specific (adjust to your domain)
-    - "impl Transaction"               # Your Transaction type
-    - "struct Energy"                  # Your Energy type
-    - "fn validate"                    # Common pattern in your code
-    - "async fn handle"                # Async handler pattern
-  
-  # Generation settings for behavioral tests
-  eval_max_length: 150              # Longer for Rust
+  - fn process
+  - impl
+  - pub struct
+  - pub enum
+  - async fn
+  - '#[derive('
+  - match
+  - Result<
+  - Option<
+  - fn new() -> Self
+  - "where\n    T:"
+  - Box<dyn
+  - Arc<Mutex<
+  - 'use std::'
+  - 'use crate::'
+  - mod
+  - pub mod
+  - impl Error for
+  - .map_err(
+  - '?'
+  - '#[cfg(test)]'
+  - mod tests {
+  - '#[test]'
+  - assert_eq!(
+  - impl Transaction
+  - struct Energy
+  - fn validate
+  - async fn handle
+  eval_max_length: 150
   eval_num_return_sequences: 1
   eval_temperature: 0.7
   eval_top_p: 0.95
-
 model_saving:
   save_final_model: true
   save_best_model: true
   save_ckpt_every_n_epochs: 1
-  
-  # Save merged model (standalone, no base needed)
   save_adapter_only: false
-  
   output_dir: models/the-block-rust-model
-
-
-  # Curriculum learning
   use_curriculum: true
   weight_by_recency: true
   weight_by_directory: false
   weight_by_author: false
-  
-  # Sequence packing (keep false for clearer commit boundaries)
   pack_sequences: false
-  
-  # RUST OPTIMIZATION: Ignore build artifacts
-  # Don't learn from generated/compiled files
   ignore_patterns:
-    - "target/"           # Cargo build directory
-    - "*.rlib"            # Rust library
-    - "*.rmeta"           # Rust metadata
-    - "*.so"              # Shared object (Linux)
-    - "*.dylib"           # Dynamic library (macOS)
-    - "*.dll"             # Dynamic library (Windows)
-    - "Cargo.lock"        # Dependency lock (changes often, low signal)
-    - "*.exe"             # Executable
-    - "*.pdb"             # Debug symbols
-    - "*.profraw"         # Profiling data
-    - "*.profdata"        # Profiling data
-  
-  # RUST OPTIMIZATION: Boost important file types
-  # When sampling commits, prefer these patterns
+  - target/
+  - '*.rlib'
+  - '*.rmeta'
+  - '*.so'
+  - '*.dylib'
+  - '*.dll'
+  - Cargo.lock
+  - '*.exe'
+  - '*.pdb'
+  - '*.profraw'
+  - '*.profdata'
   boost_patterns:
-    - "src/lib.rs"        # Library root (2x weight)
-    - "src/main.rs"       # Binary root (1.5x weight)
-    - "src/**/*.rs"       # All source files (1.3x weight)
-    - "tests/**/*.rs"     # Integration tests (0.8x weight)
-    - "benches/**/*.rs"   # Benchmarks (0.7x weight)
-    - "examples/**/*.rs" # Examples (0.7x weight)
-    - "Cargo.toml"        # Dependencies (0.5x weight)
-
+  - src/lib.rs
+  - src/main.rs
+  - src/**/*.rs
+  - tests/**/*.rs
+  - benches/**/*.rs
+  - examples/**/*.rs
+  - Cargo.toml
 output:
   manifest_file: MANIFEST_RUST.json
   report_file: training_report_rust.json
   include_generated_samples: true
-
-# RUST-SPECIFIC NOTES
-# ====================
-# 
-# 1. Sequence Length: 4096 tokens captures typical Rust modules
-#    - struct definition + impl blocks
-#    - Multiple related functions
-#    - Full error handling chains
-# 
-# 2. LoRA Rank: 16 (2x default) for Rust idiom capacity
-#    - Lifetimes, traits, generics, macros
-#    - Error propagation patterns
-#    - Ownership and borrowing styles
-# 
-# 3. Learning Rate: 2e-4 (2x default) for structured syntax
-#    - Rust compiler enforces consistent style
-#    - Less variation than dynamic languages
-#    - Faster convergence on Rust patterns
-# 
-# 4. Behavioral Tests: 25+ Rust-specific prompts
-#    - Core syntax (fn, impl, struct, enum)
-#    - Error handling (Result, Option, ?)
-#    - Async patterns
-#    - Testing patterns
-#    - Your domain-specific types
-# 
-# 5. Artifact Filtering: target/, *.rlib, Cargo.lock
-#    - Prevents learning from build outputs
-#    - Focuses on source code only
-#    - Cleaner training signal
-# 
-# Expected Performance:
-# - Training: 25-30 minutes (vs 15-20 for Python)
-# - VRAM: 6.0-6.5 GB (still fits RTX 2060)
-# - Quality: +45% for Rust-specific patterns
-# - Perplexity target: < 8 (lower = better)
+data:
+  sequences_file: data/token_sequences_rust.json
+  format: json
+  eval_split: 0.1
+  ignore_patterns:
+  - target/
+  - "*.rlib"
+  - "*.rmeta"
+  - Cargo.lock

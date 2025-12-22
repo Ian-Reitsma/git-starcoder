@@ -70,8 +70,35 @@ logger = logging.getLogger(__name__)
 def load_yaml_config(config_path: str) -> Dict:
     """Load training configuration from YAML"""
     with open(config_path) as f:
-        return yaml.safe_load(f)
+        cfg = yaml.safe_load(f) or {}
 
+    if isinstance(cfg, dict):
+        # Normalize training.base_learning_rate to float if it’s a string
+        tr = cfg.get("training")
+        if isinstance(tr, dict) and isinstance(tr.get("base_learning_rate"), str):
+            try:
+                tr["base_learning_rate"] = float(tr["base_learning_rate"])
+            except ValueError:
+                pass
+
+        # Ensure Rust build artifacts are ignored (especially for rust config)
+        data = cfg.get("data")
+        if not isinstance(data, dict):
+            data = {}
+            cfg["data"] = data
+
+        ignore = data.get("ignore_patterns")
+        if not isinstance(ignore, list):
+            ignore = []
+            data["ignore_patterns"] = ignore
+
+        rust_defaults = ["target/", "*.rlib", "*.rmeta", "Cargo.lock"]
+        # add missing defaults
+        for p in rust_defaults:
+            if p not in ignore:
+                ignore.append(p)
+
+    return cfg
 
 def set_seeds(seed: int = 42):
     """Set all random seeds for reproducibility"""
@@ -90,7 +117,7 @@ class HardwareMonitor:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.has_gpu = torch.cuda.is_available()
         self.interval = interval_seconds
-        self.last_sample_time = time.time()
+        self.last_sample_time = time.time() - interval_seconds  # allow immediate first sample
         self.stats_history = []
         self.peak_gpu_memory_mb = 0
         self.peak_ram_percent = 0
@@ -198,22 +225,34 @@ class OptimizedModelTrainer:
 
         # Device-specific overrides (important for MPS correctness)
         if self.device_backend is not None and getattr(self.device_backend, "is_metal", False):
-            # bitsandbytes quantization is CUDA-only
-            if self.model_cfg.get('use_4bit') or self.model_cfg.get('use_8bit'):
-                logger.warning("Disabling 4-bit/8-bit quantization on MPS (bitsandbytes is CUDA-only)")
+            # bitsandbytes is CUDA-only. If user requested 4/8-bit, route to MPS-native int8 backend.
+            mps_quant_requested = bool(self.model_cfg.get('use_4bit') or self.model_cfg.get('use_8bit'))
+            self.model_cfg['use_mps_int8_quant'] = mps_quant_requested
+
+            if mps_quant_requested:
+                logger.warning(
+                    "4-bit/8-bit quantization requested but bitsandbytes is CUDA-only; "
+                    "enabling MPS-native int8 weight-only quant + LoRA backend."
+                )
+
+            # Disable bnb quant flags on MPS (we're not using BitsAndBytesConfig)
             self.model_cfg['use_4bit'] = False
             self.model_cfg['use_8bit'] = False
 
-            # Checkpointing can be unstable on MPS
-            if self.train_cfg.get('use_gradient_checkpointing', False):
-                logger.warning("Disabling gradient checkpointing on MPS for stability")
-            self.train_cfg['use_gradient_checkpointing'] = False
+            # Gradient checkpointing: do NOT force-disable on MPS.
+            # If you hit instability on a specific torch/MPS build, disable it in config.
+            # (This helps memory and is one of the main levers to approach CUDA parity.)
 
-            # Prefer bf16 on MPS when possible; avoid fp16
-            if 'use_fp16' in self.model_cfg:
-                self.model_cfg['use_fp16'] = False
-            if 'use_bf16' in self.model_cfg:
-                self.model_cfg['use_bf16'] = True
+            # Precision: default to bf16 on MPS when configured; optionally allow fp16 to save memory.
+            # Set `model.mps_prefer_fp16: true` in config to force fp16 on MPS.
+            if bool(self.model_cfg.get('mps_prefer_fp16', False)):
+                self.model_cfg['use_fp16'] = True
+                self.model_cfg['use_bf16'] = False
+            else:
+                if 'use_fp16' in self.model_cfg:
+                    self.model_cfg['use_fp16'] = False
+                if 'use_bf16' in self.model_cfg:
+                    self.model_cfg['use_bf16'] = True
 
         self.amp_device = self.device.type if self.device.type in ("cuda", "cpu", "mps") else "cpu"
         self.training_output_dir: Optional[Path] = None
@@ -237,6 +276,16 @@ class OptimizedModelTrainer:
 
         set_seeds(self.train_cfg['seed'])
         
+        # Apply MPS-specific optimizations if on Metal
+        if self.device.type == 'mps':
+            try:
+                from training.mps_optimizations import apply_mps_optimizations, enable_mps_fallback
+                enable_mps_fallback()
+                mps_settings = apply_mps_optimizations(verbose=True)
+                logger.info(f"MPS optimizations applied: {list(mps_settings.keys())}")
+            except Exception as e:
+                logger.warning(f"Could not apply MPS optimizations: {e}")
+        
         logger.info(f"\n" + "="*70)
         logger.info(f"OPTIMIZED MODEL TRAINER (Multi-Architecture)")
         logger.info(f"="*70)
@@ -249,6 +298,18 @@ class OptimizedModelTrainer:
         
         self.model = None
         self.tokenizer = None
+
+        # Eagerly initialize tokenizer so downstream code/tests can call trainer.tokenizer
+        # without requiring model setup first.
+        try:
+            tok_name = self.model_cfg.get('tokenizer_name') or self.model_cfg.get('name')
+            trust_remote = bool(self.model_cfg.get('trust_remote_code', True))
+            self.tokenizer = AutoTokenizer.from_pretrained(tok_name, trust_remote_code=trust_remote)
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+        except Exception as e:
+            logger.warning(f"Tokenizer initialization failed; will retry lazily in load_data(): {e}")
+
         self.hardware_monitor = HardwareMonitor(self.config['hardware_monitoring']['collection_interval_seconds'])
         self.training_stats = {}
 
@@ -294,6 +355,11 @@ class OptimizedModelTrainer:
                 'use_8bit': bool(quant_in.get('load_in_8bit', False)),
                 'use_bf16': str(opt_in.get('mixed_precision', '')).lower() in ('bf16', 'bfloat16'),
                 'use_fp16': str(opt_in.get('mixed_precision', '')).lower() in ('fp16', 'float16'),
+                # MPS passthrough knobs (alternate schema)
+                'mps_prefer_fp16': bool(model_in.get('mps_prefer_fp16', False)),
+                'mps_quant_dtype': quant_in.get('mps_quant_dtype', model_in.get('mps_quant_dtype')),
+                'mps_group_size': quant_in.get('mps_group_size', model_in.get('mps_group_size')),
+                'mps_compute_dtype': quant_in.get('mps_compute_dtype', model_in.get('mps_compute_dtype')),
                 # required by downstream log lines
                 'pretrained_model': pretrained,
             }
@@ -722,14 +788,18 @@ class OptimizedModelTrainer:
         
         logger.info(f"Tokenizer loaded: vocab_size={len(self.tokenizer)}")
 
-        # MPS/Metal does not support bitsandbytes quantization; enforce safety here too.
+        # MPS/Metal: bitsandbytes is CUDA-only. If the run requested 4/8-bit quant, use
+        # the MPS-native int8 weight-only quant backend instead.
         if getattr(self, "device_backend", None) is not None and getattr(self.device_backend, "is_metal", False):
-            self.model_cfg['use_4bit'] = False
-            self.model_cfg['use_8bit'] = False
+            if bool(self.model_cfg.get("use_mps_int8_quant", False)):
+                # ensure bnb flags remain off
+                self.model_cfg['use_4bit'] = False
+                self.model_cfg['use_8bit'] = False
         
-        # Quantization config
+        # Quantization config (CUDA path only)
         quantization_config = None
-        if self.model_cfg['use_4bit'] or self.model_cfg['use_8bit']:
+        use_mps_int8_quant = bool(self.model_cfg.get("use_mps_int8_quant", False))
+        if (self.model_cfg['use_4bit'] or self.model_cfg['use_8bit']) and not use_mps_int8_quant:
             quantization_config = BitsAndBytesConfig(
                 load_in_4bit=self.model_cfg['use_4bit'],
                 load_in_8bit=self.model_cfg['use_8bit'],
@@ -737,15 +807,29 @@ class OptimizedModelTrainer:
                 bnb_4bit_use_double_quant=True,
             )
             logger.info(f"Quantization: {'4-bit' if self.model_cfg['use_4bit'] else '8-bit'}")
-        
+
         # Load model
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_cfg['name'],
-            quantization_config=quantization_config,
-            device_map='auto' if (self.model_cfg['use_4bit'] or self.model_cfg['use_8bit']) else None,
-            trust_remote_code=self.model_cfg['trust_remote_code'],
-            dtype=torch.bfloat16 if self.model_cfg['use_bf16'] else torch.float32,
-        )
+        if self.device.type == "mps" and use_mps_int8_quant:
+            try:
+                from training.mps_quant_backend import load_quantized_starcoder2_mps, MPSQuantConfig
+            except Exception:
+                from .mps_quant_backend import load_quantized_starcoder2_mps, MPSQuantConfig
+
+            qcfg = MPSQuantConfig.from_trainer_cfg(self.model_cfg, self.config.get("quantization", {}))
+            self.model = load_quantized_starcoder2_mps(
+                pretrained_model=self.model_cfg['name'],
+                device=self.device,
+                cfg=qcfg,
+                trust_remote_code=bool(self.model_cfg.get('trust_remote_code', True)),
+            )
+        else:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.model_cfg['name'],
+                quantization_config=quantization_config,
+                device_map='auto' if (self.model_cfg['use_4bit'] or self.model_cfg['use_8bit']) else None,
+                trust_remote_code=self.model_cfg['trust_remote_code'],
+                torch_dtype=torch.bfloat16 if self.model_cfg['use_bf16'] else torch.float32,
+            )
 
         # If not using quantized device_map, move model explicitly to selected device
         if not (self.model_cfg['use_4bit'] or self.model_cfg['use_8bit']):
@@ -766,9 +850,11 @@ class OptimizedModelTrainer:
             self.model.gradient_checkpointing_enable()
             logger.info("Gradient checkpointing enabled")
         
-        # Apply LoRA if configured
-        if self.model_cfg['use_lora']:
+        # Apply LoRA if configured (skip when using MPS quant backend; it has per-layer LoRA built in)
+        if self.model_cfg['use_lora'] and not bool(self.model_cfg.get("use_mps_int8_quant", False)):
             self.model = self._apply_lora()
+        elif bool(self.model_cfg.get("use_mps_int8_quant", False)):
+            logger.info("MPS int8 backend: LoRA is built-in per-layer; skipping PEFT LoRA application.")
         
         self.model.to(self.device)
     
@@ -860,6 +946,20 @@ class OptimizedModelTrainer:
             max_length = getattr(cfg, 'max_position_embeddings', None) or getattr(cfg, 'n_positions', None)
         if max_length is None:
             max_length = int(self.train_cfg.get('context_window', 2048)) if isinstance(self.train_cfg, dict) else 2048
+
+        # Lazy-load tokenizer so load_data() can be used without calling model setup first.
+        # This is important for unit tests and for data/throughput validation phases.
+        if self.tokenizer is None:
+            tok_name = self.model_cfg.get('tokenizer_name') or self.model_cfg.get('name')
+            trust_remote = bool(self.model_cfg.get('trust_remote_code', True))
+            logger.info(
+                f"Tokenizer not initialized; loading tokenizer '{tok_name}' (trust_remote_code={trust_remote})"
+            )
+            self.tokenizer = AutoTokenizer.from_pretrained(tok_name, trust_remote_code=trust_remote)
+            # Many causal-LM tokenizers don't define a pad token; use EOS for padding.
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+
         pad_token_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
 
         pre_tokenized = all(

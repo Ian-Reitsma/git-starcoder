@@ -34,6 +34,12 @@ sentence-transformers>=2.2.0
 qdrant-client>=1.7.0
 
 # Utilities
+# urllib3 v2 expects Python's ssl module to be linked against OpenSSL 1.1.1+.
+# Some macOS Python builds use LibreSSL, which triggers NotOpenSSLWarning (and can break TLS).
+# Pin to urllib3 1.26.x for broad compatibility.
+urllib3<2
+
+# Utilities
 tqdm>=4.66.0
 pydantic>=2.0.0
 python-dotenv>=1.0.0

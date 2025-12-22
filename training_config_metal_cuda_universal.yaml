@@ -16,6 +16,10 @@ model:
   # On CUDA: auto (any dtype works)
   torch_dtype: "auto"
 
+  # MPS memory lever: if true, force fp16 weights/autocast on Metal to reduce memory.
+  # (May be faster and help StarCoder2-3B fit on 8GB-class unified memory.)
+  mps_prefer_fp16: true
+
 quantization:
   load_in_4bit: true
   bnb_4bit_use_double_quant: true

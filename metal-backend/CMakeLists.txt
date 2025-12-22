@@ -5,7 +5,11 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 if(APPLE)
   project(orchard LANGUAGES C CXX OBJCXX)
   find_package(Metal REQUIRED)
-  set(CMAKE_OSX_ARCHITECTURES "arm64;arm64e")
+  # Do NOT force arm64e: pip/venv PyTorch wheels are typically arm64-only.
+  # Allow users to override via -DCMAKE_OSX_ARCHITECTURES=... when configuring.
+  if(NOT DEFINED CMAKE_OSX_ARCHITECTURES OR CMAKE_OSX_ARCHITECTURES STREQUAL "")
+    set(CMAKE_OSX_ARCHITECTURES "arm64" CACHE STRING "Build architectures" FORCE)
+  endif()
   set(CMAKE_OBJCXX_STANDARD 20)
   set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
   set(CMAKE_OBJCXX_EXTENSIONS ON)

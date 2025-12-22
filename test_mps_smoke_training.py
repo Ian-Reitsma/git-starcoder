@@ -39,11 +39,17 @@ class TestMPSSmokeTraining(unittest.TestCase):
             n_layer=2,
             n_head=4,
         )
+        # Transformers 4.5x+ uses `model.loss_type` (not `model.config.loss_type`) to pick the loss.
+        # Ensure it is set to a valid key in LOSS_MAPPING to avoid warnings.
+        cfg.loss_type = "ForCausalLM"
         model = GPT2LMHeadModel(cfg)
+        model.loss_type = "ForCausalLM"
 
         backend = get_device_backend(force_device="mps", verbose=False)
         backend.setup()
         backend.patch_model(model)
+        # Some backends may wrap/replace model internals and can reset attrs.
+        model.loss_type = "ForCausalLM"
 
         device = torch.device("mps")
         model.to(device)
@@ -52,6 +58,9 @@ class TestMPSSmokeTraining(unittest.TestCase):
         # One tiny batch
         input_ids = torch.randint(0, cfg.vocab_size, (2, 32), device=device)
         labels = input_ids.clone()
+
+        # Ensure patched codepaths didn't reset this before forward.
+        model.loss_type = "ForCausalLM"
 
         opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
         out = model(input_ids=input_ids, labels=labels)

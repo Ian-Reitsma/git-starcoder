@@ -18,6 +18,7 @@ import json
 import tempfile
 import torch
 import logging
+import warnings
 from pathlib import Path
 from unittest.mock import Mock, patch, MagicMock
 
@@ -59,7 +60,7 @@ class TestTrainerDataLoading:
         
         try:
             trainer = OptimizedModelTrainer('training_config.yaml')
-            train_loader, val_loader = trainer.load_data(temp_file)
+            train_loader, val_loader, *_ = trainer.load_data(temp_file)
             
             # Verify dataloaders exist and have data
             assert train_loader is not None, "Train loader should not be None"
@@ -82,7 +83,6 @@ class TestTrainerDataLoading:
             print(f"  Total sequences: 5")
             print(f"  Train/val split: {len(train_loader.dataset)}/{len(val_loader.dataset)}")
             
-            return True
         finally:
             os.unlink(temp_file)
     
@@ -106,14 +106,14 @@ class TestTrainerDataLoading:
         for snippet in rust_snippets:
             tokens = tokenizer.tokenize(snippet)
             assert len(tokens) > 0, f"Should tokenize: {snippet}"
-            # Verify key Rust tokens are present or split reasonably
-            assert '<' in ''.join(tokens) or 'T' in ''.join(tokens), "Generic syntax should be preserved"
+
+            # Only enforce "generic syntax preserved" for snippets that actually contain generics.
+            if '<' in snippet or 'T' in snippet:
+                assert '<' in ''.join(tokens) or 'T' in ''.join(tokens), "Generic syntax should be preserved"
         
         print(f"✓ Tokenizer handles Rust syntax correctly")
         print(f"  Tested {len(rust_snippets)} Rust snippets")
         print(f"  All tokenized successfully")
-        
-        return True
 
 
 class TestTrainerSaving:
@@ -143,8 +143,6 @@ class TestTrainerSaving:
         assert 'save_adapter_only' in rust_model_saving, "Rust config should have save_adapter_only"
         print(f"\n✓ Rust config save options parsed correctly")
         print(f"  save_adapter_only: {rust_model_saving['save_adapter_only']}")
-        
-        return True
     
     def test_trainer_model_saving_config_access(self):
         """Test that trainer._save_model correctly accesses config"""
@@ -166,8 +164,6 @@ class TestTrainerSaving:
         print(f"  model_saving config present: Yes")
         print(f"  save_adapter_only accessible: Yes")
         print(f"  Value: {save_adapter_only}")
-        
-        return True
 
 
 class TestTrainerHardwareMonitoring:
@@ -207,8 +203,6 @@ class TestTrainerHardwareMonitoring:
             print(f"  GPU memory: {monitor.peak_gpu_memory_mb:.0f} MB")
         else:
             print(f"  GPU: Not available")
-        
-        return True
 
 
 class TestRustConfigValidation:
@@ -223,7 +217,6 @@ class TestRustConfigValidation:
         assert Path('training_config_rust.yaml').exists(), "Rust config file should exist"
         
         print(f"✓ training_config_rust.yaml exists")
-        return True
     
     def test_rust_config_structure(self):
         """Test Rust config has correct structure"""
@@ -248,8 +241,6 @@ class TestRustConfigValidation:
         print(f"  Max position embeddings: {rust_config['model']['max_position_embeddings']}")
         print(f"  LoRA rank: {rust_config['model']['lora']['r']}")
         print(f"  Learning rate: {rust_config['training']['base_learning_rate']}")
-        
-        return True
     
     def test_rust_config_behavioral_prompts(self):
         """Test Rust config has Rust-specific eval prompts"""
@@ -272,8 +263,6 @@ class TestRustConfigValidation:
         print(f"  Total prompts: {len(prompts)}")
         print(f"  Rust keywords found: {found_keywords}")
         print(f"  Example prompts: {prompts[:3]}")
-        
-        return True
     
     def test_rust_config_ignore_patterns(self):
         """Test Rust config ignores build artifacts"""
@@ -295,8 +284,6 @@ class TestRustConfigValidation:
         print(f"  Ignore patterns: {len(ignore_patterns)}")
         print(f"  Rust artifacts filtered: {found_artifacts}")
         print(f"  All patterns: {ignore_patterns[:5]}...")
-        
-        return True
 
 
 class TestTrainerGracefulDegradation:
@@ -325,7 +312,6 @@ class TestTrainerGracefulDegradation:
             assert eval_cfg == {}, "Should use empty dict if evaluation section missing"
             
             print(f"✓ Trainer handles missing evaluation section gracefully")
-            return True
         finally:
             os.unlink(temp_config)
     
@@ -352,7 +338,6 @@ class TestTrainerGracefulDegradation:
             assert isinstance(model_saving_cfg, dict), "Should use dict for missing model_saving"
             
             print(f"✓ Trainer handles missing model_saving section gracefully")
-            return True
         finally:
             os.unlink(temp_config)
 
@@ -384,12 +369,8 @@ def run_all_integration_tests():
             total_tests += 1
             try:
                 method = getattr(test_obj, method_name)
-                result = method()
-                if result:
-                    passed += 1
-                else:
-                    failed += 1
-                    errors.append(f"{test_class.__name__}.{method_name}: returned False")
+                method()
+                passed += 1
             except Exception as e:
                 failed += 1
                 errors.append(f"{test_class.__name__}.{method_name}: {str(e)}")
