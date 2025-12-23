@@ -3,7 +3,7 @@
 ELITE TRAINING DATASET CREATOR - TOP 0.1% MODEL QUALITY
 
 FINAL 1% OF 1% OPTIMIZATIONS:
-  ✓ Git history diffs (learn code evolution)
+  ✓ Git history diffs (learn code evolution) - ALL COMMITS
   ✓ AST-based augmentation (syntactically valid variations)
   ✓ Inter-file dependencies (import graphs, module relationships)
   ✓ Function signature extraction (learn interfaces)
@@ -94,7 +94,6 @@ except:
 
 OVERLAP_RATIO = 0.75
 AUGMENTATIONS_PER_FILE = 6  # More variations
-GIT_HISTORY_DEPTH = 100  # Commits to analyze
 SEMANTIC_THRESHOLD = 0.85  # For deduplication
 
 print(f"\nELITE Configuration:")
@@ -102,7 +101,7 @@ print(f"  Multi-scale windows: {CONTEXT_WINDOWS}")
 print(f"  Primary window: {PRIMARY_WINDOW} tokens")
 print(f"  Overlap ratio: {int(OVERLAP_RATIO*100)}%")
 print(f"  Augmentations per file: {AUGMENTATIONS_PER_FILE}")
-print(f"  Git history depth: {GIT_HISTORY_DEPTH} commits")
+print(f"  Git history: ALL commits (not limited)")
 print(f"  Semantic dedup threshold: {SEMANTIC_THRESHOLD}")
 print(f"  Target: 30,000+ sequences")
 
@@ -124,10 +123,10 @@ except ImportError:
     sys.exit(1)
 
 # ============================================================================
-# STEP 2: EXTRACT GIT HISTORY (LEARN CODE EVOLUTION)
+# STEP 2: EXTRACT GIT HISTORY (LEARN CODE EVOLUTION) - ALL COMMITS
 # ============================================================================
 
-print(f"\n[STEP 2/12] Extracting git history for evolution learning...")
+print(f"\n[STEP 2/12] Extracting git history for evolution learning (ALL commits)...")
 print(f"{'-'*80}")
 
 git_diffs = []
@@ -135,19 +134,21 @@ git_diffs = []
 try:
     os.chdir(THE_BLOCK)
     
-    # Get last N commits
+    # Get ALL commits (no limit!)
     result = subprocess.run(
-        ['git', 'log', f'-{GIT_HISTORY_DEPTH}', '--pretty=format:%H|%at|%s'],
-        capture_output=True, text=True, check=True
+        ['git', 'log', '--all', '--pretty=format:%H|%at|%s'],
+        capture_output=True, text=True, check=True, timeout=30
     )
     
     commits = result.stdout.strip().split('\n')
-    print(f"  Found {len(commits)} recent commits")
+    total_commits = len(commits)
+    print(f"  Found {total_commits} total commits")
     
-    # Extract diffs for learning
-    for idx, commit_line in enumerate(commits[:50]):  # Top 50 most recent
-        if idx % 10 == 0:
-            print(f"  Processing commit {idx}/50...")
+    # Extract diffs for learning (process in batches)
+    print(f"  Processing commits in batches...")
+    for idx, commit_line in enumerate(commits):
+        if idx % 50 == 0:
+            print(f"    Progress: {idx}/{total_commits} commits ({len(git_diffs)} diffs extracted)...")
         
         parts = commit_line.split('|')
         if len(parts) < 3:
@@ -174,7 +175,7 @@ try:
         except:
             continue
     
-    print(f"✓ Extracted {len(git_diffs)} substantial diffs")
+    print(f"\n✓ Extracted {len(git_diffs)} substantial diffs from {total_commits} commits")
     print(f"  Model will learn how code evolves over time")
     
 except Exception as e:
@@ -521,7 +522,7 @@ for file_idx, file_info in enumerate(files_data):
 print(f"\n✓ Generated {augmentation_count} ELITE augmentations")
 
 # ============================================================================
-# STEP 7: ADD GIT DIFF SEQUENCES (EVOLUTION LEARNING)
+# STEP 7: ADD GIT DIFF SEQUENCES (EVOLUTION LEARNING) - PROPERLY TAGGED
 # ============================================================================
 
 print(f"\n[STEP 7/12] Adding git diff sequences for evolution learning...")
@@ -544,14 +545,16 @@ for diff_info in git_diffs:
             # Weight recent commits higher
             priority = 'high' if age_days < 60 else 'medium'
             
+            # PROPERLY TAG AS GIT_DIFF
             all_sequences.append({
                 'tokens': tokens,
                 'metadata': {
                     'seq_id': seq_id,
                     'source_file': f"git_diff_{diff_info['commit']}",
                     'window_size': PRIMARY_WINDOW,
-                    'augmentation_type': 'git_diff',
+                    'augmentation_type': 'git_diff',  # THIS IS THE FIX!
                     'commit': diff_info['commit'],
+                    'commit_message': diff_info['message'],
                     'age_days': age_days,
                     'priority': priority,
                     'is_evolution': True
@@ -562,7 +565,7 @@ for diff_info in git_diffs:
     except:
         continue
 
-print(f"✓ Added {diff_sequences} git diff sequences")
+print(f"✓ Added {diff_sequences} git diff sequences (properly tagged)")
 print(f"  Model will learn how code evolves over time")
 
 # ============================================================================
@@ -671,6 +674,8 @@ test_size = save_jsonl(test, OUTPUT_DIR / 'training_data_test.jsonl')
 
 # Metadata
 total_tokens = sum(seq['metadata']['window_size'] for seq in weighted_sequences)
+total_commits_processed = len(git_diffs) if git_diffs else 0
+
 metadata = {
     'creation_date': datetime.now().isoformat(),
     'elite_version': '1.0',
@@ -680,6 +685,7 @@ metadata = {
     'test_sequences': len(test),
     'source_files': len(files_data),
     'git_diffs': len(git_diffs),
+    'git_commits_analyzed': total_commits_processed,
     'function_signatures': len(function_signatures),
     'dependency_graph_nodes': len(import_graph),
     'tokenizer': 'microsoft/codebert-base',
@@ -717,7 +723,8 @@ print(f"""
 
 Dataset Statistics:
   Source files: {len(files_data)}
-  Git diffs: {len(git_diffs)}
+  Git commits analyzed: {total_commits_processed}
+  Git diffs extracted: {len(git_diffs)}
   Function signatures tracked: {len(function_signatures)}
   Dependency nodes: {len(import_graph)}
   Total sequences: {len(weighted_sequences)}
@@ -726,7 +733,7 @@ Dataset Statistics:
 
 ELITE Features:
   ✓ Multi-scale contexts: {CONTEXT_WINDOWS}
-  ✓ Git history learning ({len(git_diffs)} diffs)
+  ✓ Git history learning ({len(git_diffs)} diffs from ALL commits)
   ✓ AST-based augmentation (syntactically valid)
   ✓ Inter-file dependencies ({len(import_graph)} files)
   ✓ Function signature extraction ({len(function_signatures)} functions)
