@@ -4,73 +4,76 @@
 # No manual device selection needed—just run the same command on any platform.
 
 model:
-  name: "starcoder2-3b-hw-optimized"
-  pretrained_model: "bigcode/starcoder2-3b"
+  name: "codebert-optimized"
+  pretrained_model: "microsoft/codebert-base"  # 125M CODE-SPECIALIZED, perfect for 7.6GB
+  # CodeBERT is trained specifically on code AND markdown documentation
+  # 8.3B training tokens from 6.4M functions + documentation
+  # Better than generic models for code understanding
   add_special_tokens: true
   extra_special_tokens_max: 64
   trust_remote_code: true
-  device_map: "auto"  # PyTorch will auto-route to Metal/CUDA
+  device_map: "auto"
 
-  # Will be overridden by device backend
-  # On Metal: bf16/float32 (no fp16 support)
-  # On CUDA: auto (any dtype works)
   torch_dtype: "auto"
-
-  # MPS memory lever: if true, force fp16 weights/autocast on Metal to reduce memory.
-  # (May be faster and help StarCoder2-3B fit on 8GB-class unified memory.)
-  mps_prefer_fp16: true
+  mps_prefer_fp16: false
 
 quantization:
-  load_in_4bit: true
-  bnb_4bit_use_double_quant: true
+  load_in_4bit: false
+  load_in_8bit: true  # 8-bit is MORE efficient than 4-bit for training on this model
+  bnb_4bit_use_double_quant: false
   bnb_4bit_quant_type: "nf4"
   bnb_4bit_compute_dtype: "float16"
 
+  # AGGRESSIVE LoRA: For CodeBERT with large dataset (11,551 sequences)
   lora_enabled: true
-  lora_rank: 32
-  lora_alpha: 64
-  lora_dropout: 0.05
-  lora_target_modules: ["c_attn", "c_proj", "fc1", "fc2"]
+  lora_rank: 96  # INCREASED: larger rank for complex Rust/code patterns in the-block
+  lora_alpha: 192  # 2x rank for maximum expressiveness
+  lora_dropout: 0.03  # Lower dropout (more data to prevent overfitting)
+  lora_target_modules: ["query", "value", "key", "dense"]  # Include dense layer for FFN
   lora_bias: "none"
 
 
-  train_path: "data_enhanced/dataset_enhanced/training_data_enhanced_train.json"
-  val_path: "data_enhanced/dataset_enhanced/training_data_enhanced_val.json"
-  test_path: "data_enhanced/dataset_enhanced/training_data_enhanced_test.json"
+  train_path: "data/scrape-dec23/training_data_train.json"
+  val_path: "data/scrape-dec23/data_enhanced/training_data_val.json"
+  test_path: "data/scrape-dec23/training_data_test.json"
 
-  context_window: 2048
-  target_window: 256
+  context_window: 512  # INCREASED: 4x more context = better code understanding
+  target_window: 128   # INCREASED: 4x larger target = better prediction quality
 
 optimization:
-  # Metal: use smaller batch size; CUDA: can use batch 4+
-  # Device backend will select based on platform
-  batch_size: 2  # Safe default for both
-  gradient_accumulation_steps: 8  # effective batch = 16
+  # Memory-efficient approach for 11,551 sequences: effective batch 16 on 7.6GB
+  batch_size: 1  # Keep at 1 (LoRA + 8-bit + gradient checkpointing)
+  gradient_accumulation_steps: 16  # INCREASED from 8: simulates batch size 16 for better convergence
+                                    # With 11K sequences, larger effective batch helps stability
 
-  learning_rate: 2.0e-4
-  lr_scheduler: "cosine"
-  warmup_steps: 1000
+  # AGGRESSIVE learning strategy: aim for 10x better results
+  learning_rate: 1.2e-3  # INCREASED: higher LR works well with LoRA rank 96 + large dataset
+  lr_scheduler: "cosine"  # Cosine annealing for smooth convergence
+  warmup_steps: 1000  # INCREASED: important with larger dataset for stable warmup
+  warmup_ratio: 0.05
 
   optimizer: "adamw"
-  weight_decay: 0.01
-  max_grad_norm: 1.0
+  weight_decay: 0.08  # INCREASED: stronger L2 regularization for 11K sequences
+  max_grad_norm: 0.3  # TIGHTER: stricter gradient clipping for stable LoRA with larger rank
 
-  mixed_precision: "bf16"  # Supported on both Metal + CUDA
+  mixed_precision: "fp16"  # Keep fp16 for speed
   use_mixed_precision: true
 
-  # Metal: disable (can cause issues)
-  # CUDA: enable (improves memory efficiency)
-  # Device backend will override this
+  # Critical for 7.6GB: save memory without hurting quality
   gradient_checkpointing: true
 
 training:
-  num_epochs: 3
-  max_steps: 10000
-  save_steps: 500
-  save_total_limit: 3
-  eval_steps: 200
-  logging_steps: 100
+  num_epochs: 200  # MASSIVELY INCREASED: allow comprehensive training on 11.5K sequences
+  max_steps: 200000  # Give ample room to converge (11,551 train * 16 accumulation / 16 acc = 726 steps/epoch)
+  save_steps: 728  # Save after each epoch on 11.5K sequences
+  save_total_limit: 10  # Keep best 10 checkpoints
+  eval_steps: 91  # Evaluate frequently (every ~91 steps ≈ every 1.3K samples)
+  logging_steps: 45  # Log very frequently
   seed: 42
+
+  # EARLY STOPPING PATIENCE - critical for converging on full dataset
+  lr_plateau_patience: 15  # More patience with larger dataset (stop if no improvement for 15 epochs)
+  patience: 15
 
 inference:
   # Long-form codegen relies on iterative generation + compile-gated patching

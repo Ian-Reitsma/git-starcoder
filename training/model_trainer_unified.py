@@ -190,6 +190,8 @@ class OptimizedModelTrainer:
         # Ensure optional sections exist with safe defaults.
         self.config.setdefault('hardware_monitoring', {})
         self.config['hardware_monitoring'].setdefault('collection_interval_seconds', 5.0)
+        self.config['hardware_monitoring'].setdefault('gpu_memory_threshold_large_gb', 24.0)
+        self.config['hardware_monitoring'].setdefault('gpu_memory_threshold_medium_gb', 12.0)
         self.config.setdefault('training', {})
         self.config['training'].setdefault('drop_full_attention_mask', True)
         self.config['training'].setdefault('deterministic_mode', False)
@@ -360,6 +362,14 @@ class OptimizedModelTrainer:
                 'mps_quant_dtype': quant_in.get('mps_quant_dtype', model_in.get('mps_quant_dtype')),
                 'mps_group_size': quant_in.get('mps_group_size', model_in.get('mps_group_size')),
                 'mps_compute_dtype': quant_in.get('mps_compute_dtype', model_in.get('mps_compute_dtype')),
+                # LoRA configuration (from alternate schema quantization section)
+                'lora': {
+                    'r': int(quant_in.get('lora_rank', 32)),
+                    'lora_alpha': int(quant_in.get('lora_alpha', 64)),
+                    'target_modules': quant_in.get('lora_target_modules', ['c_attn', 'c_proj', 'fc1', 'fc2']),
+                    'lora_dropout': float(quant_in.get('lora_dropout', 0.05)),
+                    'bias': quant_in.get('lora_bias', 'none'),
+                },
                 # required by downstream log lines
                 'pretrained_model': pretrained,
             }
@@ -1461,9 +1471,9 @@ class OptimizedModelTrainer:
             if (last_step_idx + 1) % self.train_cfg['gradient_accumulation_steps'] != 0:
                 logger.info("Performing final optimizer step for leftover gradients.")
 
-                if use_amp:
+                if use_scaler:
                     scaler.unscale_(optimizer)
-                
+
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(), self.train_cfg['max_grad_norm']
                 )
@@ -1475,7 +1485,7 @@ class OptimizedModelTrainer:
                 total_norm = total_norm ** 0.5
                 epoch_grad_norms.append(total_norm)
 
-                if use_amp:
+                if use_scaler:
                     self._safe_scaled_step(scaler, optimizer)
                     scaler.update()
                 else:
@@ -1569,9 +1579,10 @@ class OptimizedModelTrainer:
                     )
             else:
                 patience_counter += 1
-                logger.info(f"  ✗ No improvement (patience: {patience_counter}/{self.train_cfg['patience']})")
-                
-                if patience_counter >= self.train_cfg['patience']:
+                patience_limit = self.train_cfg.get('lr_plateau_patience', 2)
+                logger.info(f"  ✗ No improvement (patience: {patience_counter}/{patience_limit})")
+
+                if patience_counter >= patience_limit:
                     logger.info(f"\nEarly stopping at epoch {epoch+1}")
                     should_break = True
 
@@ -1692,10 +1703,10 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="training_config.yaml")
-    parser.add_argument("--sequences", default="data/token_sequences_rich.json")
-    parser.add_argument("--epochs", type=int, default=6)
-    parser.add_argument("--output", default="models/the-block-git-model-final")
+    parser.add_argument("--config", default="training_config_metal_cuda_universal.yaml")
+    parser.add_argument("--sequences", default="/data/scrape-dec23/commits_rich.json")
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--output", default="models/the-block-dec23")
     parser.add_argument(
         "--device",
         default=None,

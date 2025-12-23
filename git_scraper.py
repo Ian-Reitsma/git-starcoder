@@ -102,6 +102,8 @@ class GitScraper:
                 ["git", "-C", str(self.repo_path)] + list(args),
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=30
             )
             if result.returncode != 0:
@@ -218,15 +220,19 @@ class GitScraper:
             try:
                 patch_output = self._run_git(
                     "show",
-                    f"{commit_hash}:{filename}",
+                    commit_hash,
+                    "--",
+                    filename,
                 )
                 
                 # Get file stats
                 stats = self._run_git(
                     "show",
-                    f"--stat=100",
+                    "--stat=100",
                     "--format=",
-                    f"{commit_hash} -- {filename}",
+                    commit_hash,
+                    "--",
+                    filename,
                 )
                 
                 stats_parts = stats.split(",")
@@ -329,18 +335,20 @@ class GitScraper:
             "branches_found": len(set(b.branch_name for c in commit_records for b in c.branches)),
         }
     
-    def save_results(self,  Dict[str, Any], output_file: Optional[str] = None) -> Path:
+    def save_results(self, data: Dict[str, Any], output_file: Optional[str] = None) -> Path:
         """Save scrape results to JSON."""
         if output_file is None:
-            output_file = self.output_dir / "commits_rich.json"
+            output_path = self.output_dir / "commits_rich.json"
         else:
-            output_file = Path(output_file)
+            output_path = Path(output_file)
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         
-        with open(output_file, "w", encoding="utf-8") as f:
+        with open(output_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
         
-        logger.info(f"Saved results to {output_file}")
-        return output_file
+        logger.info(f"Saved results to {output_path}")
+        return output_path
 
 
 def main():

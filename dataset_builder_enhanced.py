@@ -105,8 +105,8 @@ class EnhancedDatasetBuilder:
         commit_groups: Dict[str, List[int]] = defaultdict(list)
         
         # Group tokens by commit
-        for idx, meta in enumerate(metadata):  # FIXED: corrected variable name
-            commit_hash = meta.get("commit_hash", "unknown")
+        for idx, m in enumerate(meta):
+            commit_hash = m.get("commit_hash", "unknown")
             commit_groups[commit_hash].append(idx)
         
         logger.info(f"Found {len(commit_groups)} unique commits")
@@ -232,9 +232,9 @@ class EnhancedDatasetBuilder:
         meta: List[Dict[str, Any]]  # FIXED: type annotation
     ) -> List[Dict[str, Any]]:
         """Build training examples (commit-based or sequential)."""
-        
+
         if self.commit_based:
-            return self.build_commit_based_examples(tokens, metadata)
+            return self.build_commit_based_examples(tokens, meta)
         else:
             return self.build_sequential_window_examples(tokens)
     
@@ -278,25 +278,25 @@ class EnhancedDatasetBuilder:
     
     def save_dataset(
         self,
-        train_: List[Dict[str, Any]],  # FIXED: proper type annotation and param name
-        val_: List[Dict[str, Any]],    # FIXED: proper type annotation and param name
-        test_: List[Dict[str, Any]],   # FIXED: proper type annotation and param name
+        train_data: List[Dict[str, Any]],
+        val_data: List[Dict[str, Any]],
+        test_data: List[Dict[str, Any]],
         prefix: str = "training_data_enhanced"
     ) -> Dict[str, Path]:
         """Save dataset splits to disk."""
         output_paths = {}
-        
+
         for split_name, data in [("train", train_data), ("val", val_data), ("test", test_data)]:
             output_path = self.output_dir / f"{prefix}_{split_name}.json"
-            
+
             logger.info(f"Saving {split_name} data to {output_path}...")
-            
+
             with open(output_path, "w", encoding="utf-8") as f:
                 json.dump(data, f)
-            
+
             output_paths[split_name] = output_path
             logger.info(f"Saved {len(data)} {split_name} examples to {output_path}")
-        
+
         return output_paths
     
     def save_statistics(self, prefix: str = "dataset_stats_enhanced") -> Path:
