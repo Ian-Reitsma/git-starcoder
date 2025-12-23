@@ -31,7 +31,7 @@ print(f"\nSource: {THE_BLOCK}")
 print(f"Output: {OUTPUT_DIR}")
 
 if not THE_BLOCK.exists():
-    print(f"\n\u274c Error: {THE_BLOCK} not found")
+    print(f"\nError: {THE_BLOCK} not found")
     exit(1)
 
 # Create output directory
@@ -74,7 +74,7 @@ for root, dirs, filenames in os.walk(THE_BLOCK):
             except:
                 pass
 
-print(f"\n\u2713 Found {len(files_data)} source files with content")
+print(f"\nFound {len(files_data)} source files with content")
 
 # ============================================================================
 # STEP 2: Create Training Sequences
@@ -142,7 +142,7 @@ for dir_name, dir_files in sorted(directories.items()):
         if seq_id % 500 == 0:
             print(f"  Created {seq_id} sequences...")
 
-print(f"\n\u2713 Created {len(sequences)} training sequences")
+print(f"\nCreated {len(sequences)} training sequences")
 
 # ============================================================================
 # STEP 3: Split and Save
@@ -197,10 +197,10 @@ metadata = {
 with open(OUTPUT_DIR / 'sequences_metadata.json', 'w') as f:
     json.dump(metadata, f, indent=2)
 
-print(f"\n\u2713 training_data_train.json: {len(train)} sequences ({train_size:.1f} MB)")
-print(f"\u2713 training_data_val.json: {len(val)} sequences ({val_size:.1f} MB)")
-print(f"\u2713 training_data_test.json: {len(test)} sequences ({test_size:.1f} MB)")
-print(f"\u2713 sequences_metadata.json: saved")
+print(f"\ntraining_data_train.json: {len(train)} sequences ({train_size:.1f} MB)")
+print(f"training_data_val.json: {len(val)} sequences ({val_size:.1f} MB)")
+print(f"training_data_test.json: {len(test)} sequences ({test_size:.1f} MB)")
+print(f"sequences_metadata.json: saved")
 
 # ============================================================================
 # FINAL SUMMARY
@@ -208,21 +208,21 @@ print(f"\u2713 sequences_metadata.json: saved")
 
 print(f"""
 {"="*70}
-  \u2713 DATASET CREATION COMPLETE!
+  DATASET CREATION COMPLETE!
 {"="*70}
 
 Dataset Statistics:
-  \u2022 Source files scanned: {len(files_data)}
-  \u2022 Directories: {len(directories)}
-  \u2022 Total sequences: {len(sequences)}
-  \u2022 Dataset size: {train_size + val_size + test_size:.1f} MB
+  Source files scanned: {len(files_data)}
+  Directories: {len(directories)}
+  Total sequences: {len(sequences)}
+  Dataset size: {train_size + val_size + test_size:.1f} MB
 
 Files Created:
   {OUTPUT_DIR}/
-  \u251c\u2500 training_data_train.json    ({len(train)} sequences)
-  \u251c\u2500 training_data_val.json      ({len(val)} sequences)
-  \u251c\u2500 training_data_test.json     ({len(test)} sequences)
-  \u2514\u2500 sequences_metadata.json     (metadata)
+  |-- training_data_train.json    ({len(train)} sequences)
+  |-- training_data_val.json      ({len(val)} sequences)
+  |-- training_data_test.json     ({len(test)} sequences)
+  |-- sequences_metadata.json     (metadata)
 
 Next Steps:
 
@@ -251,13 +251,13 @@ Next Steps:
      --device cuda 2>&1 | tee training.log
 
 Timeline:
-  \u2022 Dataset creation: DONE
-  \u2022 Config update: 1 minute
-  \u2022 Test run: 5-30 minutes
-  \u2022 Full training: 10-50 hours
+  Dataset creation: DONE
+  Config update: 1 minute
+  Test run: 5-30 minutes
+  Full training: 10-50 hours
 
 {"="*70}
 """)
 
-print("\nDataset ready! \ud83d\ude80")
+print("\nDataset ready!")
 print(f"\nRun this next:\n  vim training_config_metal_cuda_universal.yaml")
