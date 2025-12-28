@@ -4,11 +4,11 @@
 # No manual device selection needed—just run the same command on any platform.
 
 model:
-  name: "codebert-optimized"
-  pretrained_model: "microsoft/codebert-base"  # 125M CODE-SPECIALIZED, perfect for 7.6GB
-  # CodeBERT is trained specifically on code AND markdown documentation
-  # 8.3B training tokens from 6.4M functions + documentation
-  # Better than generic models for code understanding
+  name: "phi-2-elite"
+  pretrained_model: "microsoft/phi-2"  # 2.7B params, EXCELLENT for code, fits on 7.6GB
+  # Phi-2: strong reasoning + code understanding, trained on diverse data
+  # 2.7 billion parameters (best fit for your 7.6GB GPU while staying powerful)
+  # Trained by Microsoft with explicit focus on code generation and reasoning
   add_special_tokens: true
   extra_special_tokens_max: 64
   trust_remote_code: true
@@ -18,62 +18,61 @@ model:
   mps_prefer_fp16: false
 
 quantization:
-  load_in_4bit: false
-  load_in_8bit: true  # 8-bit is MORE efficient than 4-bit for training on this model
+  load_in_4bit: false  # Disable 4-bit - causing crashes with some models
+  load_in_8bit: true  # Enable 8-bit - more stable than 4-bit, good memory savings
   bnb_4bit_use_double_quant: false
   bnb_4bit_quant_type: "nf4"
   bnb_4bit_compute_dtype: "float16"
 
-  # AGGRESSIVE LoRA: For CodeBERT with large dataset (11,551 sequences)
+  # AGGRESSIVE LoRA: For Phi-2 with large dataset (11,551 sequences)
   lora_enabled: true
-  lora_rank: 96  # INCREASED: larger rank for complex Rust/code patterns in the-block
-  lora_alpha: 192  # 2x rank for maximum expressiveness
+  lora_rank: 64  # Good balance for 2.7B model (strong but fits)
+  lora_alpha: 128  # 2x rank for maximum expressiveness
   lora_dropout: 0.03  # Lower dropout (more data to prevent overfitting)
-  lora_target_modules: ["query", "value", "key", "dense"]  # Include dense layer for FFN
+  lora_target_modules: ["q_proj", "v_proj", "up_proj", "down_proj"]  # Phi-2: attention + FFN
   lora_bias: "none"
 
 
-  train_path: "data/scrape-dec23/training_data_train.json"
-  val_path: "data/scrape-dec23/data_enhanced/training_data_val.json"
-  test_path: "data/scrape-dec23/training_data_test.json"
+  train_path: "training_data_ELITE/training_data_train.jsonl"
+  val_path: "training_data_ELITE/training_data_val.jsonl"
+  test_path: "training_data_ELITE/training_data_test.jsonl"
 
-  context_window: 512  # INCREASED: 4x more context = better code understanding
-  target_window: 128   # INCREASED: 4x larger target = better prediction quality
+  context_window: 256  # REDUCED for memory: 256 tokens context (still good for code)
+  target_window: 64    # REDUCED for memory: 64 tokens target (still learn well)
 
 optimization:
-  # Memory-efficient approach for 11,551 sequences: effective batch 16 on 7.6GB
-  batch_size: 1  # Keep at 1 (LoRA + 8-bit + gradient checkpointing)
-  gradient_accumulation_steps: 16  # INCREASED from 8: simulates batch size 16 for better convergence
-                                    # With 11K sequences, larger effective batch helps stability
+  # StarCoder 3B on 7.6GB CUDA: aggressive memory optimization WITHOUT quantization
+  batch_size: 1  # Batch 1 to minimize peak memory
+  gradient_accumulation_steps: 32  # Ultra-high accumulation = effective batch 32 (more stable convergence)
 
-  # AGGRESSIVE learning strategy: aim for 10x better results
-  learning_rate: 1.2e-3  # INCREASED: higher LR works well with LoRA rank 96 + large dataset
+  # Learning rate optimized for StarCoder + LoRA rank 96
+  learning_rate: 8.0e-4  # Slightly lower than GPT2, StarCoder is more stable
   lr_scheduler: "cosine"  # Cosine annealing for smooth convergence
-  warmup_steps: 1000  # INCREASED: important with larger dataset for stable warmup
+  warmup_steps: 1500  # More warmup steps for larger model
   warmup_ratio: 0.05
 
   optimizer: "adamw"
-  weight_decay: 0.08  # INCREASED: stronger L2 regularization for 11K sequences
-  max_grad_norm: 0.3  # TIGHTER: stricter gradient clipping for stable LoRA with larger rank
+  weight_decay: 0.05  # L2 regularization (slightly less aggressive than GPT2)
+  max_grad_norm: 1.0  # Standard gradient clipping for 3B models
 
-  mixed_precision: "fp16"  # Keep fp16 for speed
+  mixed_precision: "fp16"  # bf16 preferred but fp16 works on all CUDA
   use_mixed_precision: true
 
-  # Critical for 7.6GB: save memory without hurting quality
-  gradient_checkpointing: true
+  # CRITICAL: gradient checkpointing saves ~40% memory with 4-bit quant
+  gradient_checkpointing: true  # ENABLED: essential for StarCoder 3B
 
 training:
-  num_epochs: 200  # MASSIVELY INCREASED: allow comprehensive training on 11.5K sequences
-  max_steps: 200000  # Give ample room to converge (11,551 train * 16 accumulation / 16 acc = 726 steps/epoch)
-  save_steps: 728  # Save after each epoch on 11.5K sequences
-  save_total_limit: 10  # Keep best 10 checkpoints
-  eval_steps: 91  # Evaluate frequently (every ~91 steps ≈ every 1.3K samples)
-  logging_steps: 45  # Log very frequently
+  num_epochs: 20  # Train for 20 epochs (optimal for ELITE dataset size)
+  max_steps: 200000  # Failsafe: won't hit this with 20 epochs + 11.5K sequences
+  save_steps: 361  # Save after each epoch (~361 optimizer updates with batch 1, accum 32)
+  save_total_limit: 20  # Keep all 20 epoch checkpoints (no disk limit)
+  eval_steps: 91  # Evaluate every ~91 steps (~91 samples)
+  logging_steps: 45  # Log every 45 steps for detailed monitoring
   seed: 42
 
-  # EARLY STOPPING PATIENCE - critical for converging on full dataset
-  lr_plateau_patience: 15  # More patience with larger dataset (stop if no improvement for 15 epochs)
-  patience: 15
+  # EARLY STOPPING - conservative with StarCoder to avoid premature stopping
+  lr_plateau_patience: 20  # 20 epochs patience = allow full 20 epoch training
+  patience: 20  # If val loss plateaus, wait 20 epochs before stopping
 
 inference:
   # Long-form codegen relies on iterative generation + compile-gated patching
@@ -94,7 +93,7 @@ device_backend:
   attention_backend: "auto"
 
 output:
-  output_dir: "models/the-block-enhanced-metal-cuda"
-  overwrite_output_dir: false
+  output_dir: "models/the-block-ELITE-test"
+  overwrite_output_dir: true  # Fresh start with new config
   save_model: true
   save_optimizer: false

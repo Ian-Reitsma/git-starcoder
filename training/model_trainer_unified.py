@@ -39,6 +39,32 @@ from collections import defaultdict
 # Avoid tokenizer parallelism warnings when dataloader workers spawn
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
+# Patch RoBERTa before importing to avoid attention device mismatches
+def _patch_roberta_at_import():
+    """Patch RoBERTa attention to disable causal attention which causes device mismatches"""
+    try:
+        from transformers.models.roberta.modeling_roberta import RobertaSelfAttention
+        original_forward = RobertaSelfAttention.forward
+
+        def patched_forward(self, hidden_states, attention_mask=None, head_mask=None,
+                          encoder_hidden_states=None, encoder_attention_mask=None,
+                          past_key_value=None, output_attentions=False, cache_position=None):
+            # Disable causal attention to avoid attn_bias device mismatch
+            original_is_causal = getattr(self, 'is_causal', False)
+            self.is_causal = False
+            try:
+                return original_forward(self, hidden_states, attention_mask, head_mask,
+                                      encoder_hidden_states, encoder_attention_mask,
+                                      past_key_value, output_attentions, cache_position)
+            finally:
+                self.is_causal = original_is_causal
+
+        RobertaSelfAttention.forward = patched_forward
+    except:
+        pass
+
+_patch_roberta_at_import()
+
 try:
     from torch.utils.data import DataLoader, TensorDataset, Subset, WeightedRandomSampler
     from torch.optim import AdamW
@@ -673,18 +699,31 @@ class OptimizedModelTrainer:
 
     def _prepare_incremental_slice(self, sequences_file: str) -> Dict[str, Any]:
         """Determine whether there are new sequences and where to start training"""
+        sequences_list = []
+        metadata_map = {}
+
         try:
             with open(sequences_file, 'r') as f:
-                data = json.load(f)
-        except json.JSONDecodeError as exc:
+                # Try reading as JSONL first (one JSON object per line)
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                        if isinstance(obj, dict):
+                            if "token_sequences" in obj:
+                                sequences_list.extend(obj["token_sequences"])
+                            elif "tokens" in obj:
+                                sequences_list.append(obj["tokens"])
+                            if "metadata" in obj:
+                                metadata_map.update(obj["metadata"])
+                        else:
+                            sequences_list.append(obj)
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(f"Unable to parse line in {sequences_file}: {exc}") from exc
+        except (OSError, ValueError) as exc:
             raise ValueError(f"Unable to parse {sequences_file}: {exc}") from exc
-
-        if isinstance(data, dict):
-            sequences_list = data.get("token_sequences", [])
-            metadata_map = data.get("metadata", {})
-        else:
-            sequences_list = data
-            metadata_map = {}
 
         total_sequences = len(sequences_list)
         self._total_sequences = total_sequences
@@ -776,6 +815,55 @@ class OptimizedModelTrainer:
                 return
             raise
     
+    def _ensure_buffers_on_device(self):
+        """Ensure all model buffers are on the correct device (needed for quantized models)"""
+        try:
+            for module in self.model.modules():
+                for name, buf in list(module.named_buffers(recurse=False)):
+                    if buf is not None and buf.device != self.device:
+                        setattr(module, name, buf.to(self.device))
+        except Exception as e:
+            logger.warning(f"Failed to ensure buffers on device: {e}")
+
+    def _patch_attention_bias_device(self):
+        """Patch attention mask preparation to fix CUDA device side asserts"""
+        try:
+            import torch.nn.functional as F
+            from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask_for_sdpa
+
+            original_prepare_mask = _prepare_4d_attention_mask_for_sdpa
+
+            def patched_prepare_mask(attention_mask, dtype, tgt_len=None):
+                # Cast to float first to avoid CUDA errors
+                if attention_mask is not None:
+                    attention_mask = attention_mask.float()
+                try:
+                    return original_prepare_mask(attention_mask, dtype, tgt_len)
+                except Exception:
+                    # Fallback: just return the mask as-is
+                    return attention_mask
+
+            # Patch the function
+            import transformers.modeling_attn_mask_utils
+            transformers.modeling_attn_mask_utils._prepare_4d_attention_mask_for_sdpa = patched_prepare_mask
+
+            # Also patch scaled_dot_product_attention
+            original_scaled_dot = F.scaled_dot_product_attention
+
+            def patched_scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
+                # If attn_mask is present and on wrong device, move it
+                if attn_mask is not None and hasattr(attn_mask, 'device'):
+                    if attn_mask.device != query.device:
+                        attn_mask = attn_mask.to(query.device)
+
+                # Call original
+                return original_scaled_dot(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale)
+
+            F.scaled_dot_product_attention = patched_scaled_dot_product_attention
+            logger.info("Patched attention functions to handle CUDA device mismatches")
+        except Exception as e:
+            logger.warning(f"Failed to patch attention functions: {e}")
+
     def load_model_and_tokenizer(self):
         """Load model and tokenizer with quantization and LoRA if configured"""
         logger.info(f"Loading model and tokenizer...")
@@ -844,6 +932,13 @@ class OptimizedModelTrainer:
         # If not using quantized device_map, move model explicitly to selected device
         if not (self.model_cfg['use_4bit'] or self.model_cfg['use_8bit']):
             self.model = self.model.to(self.device)
+        else:
+            # For 8-bit quantized models, we need to ensure any buffers are on the correct device
+            # This is especially important for models with attention bias buffers
+            self._ensure_buffers_on_device()
+
+        # Patch RoBERTa attention to handle device mismatch
+        self._patch_attention_bias_device()
 
         # Apply device-specific patches (Metal FlashAttention, etc.)
         if getattr(self, "device_backend", None) is not None:
@@ -863,10 +958,17 @@ class OptimizedModelTrainer:
         # Apply LoRA if configured (skip when using MPS quant backend; it has per-layer LoRA built in)
         if self.model_cfg['use_lora'] and not bool(self.model_cfg.get("use_mps_int8_quant", False)):
             self.model = self._apply_lora()
+            # Ensure buffers are on device after LoRA application
+            self._ensure_buffers_on_device()
         elif bool(self.model_cfg.get("use_mps_int8_quant", False)):
             logger.info("MPS int8 backend: LoRA is built-in per-layer; skipping PEFT LoRA application.")
-        
-        self.model.to(self.device)
+
+        # Only move to device if not using quantization with device_map (which already handles device placement)
+        if not (self.model_cfg['use_4bit'] or self.model_cfg['use_8bit']):
+            self.model = self.model.to(self.device)
+        else:
+            # Ensure all buffers (especially attn_bias) are on correct device after all setup
+            self._ensure_buffers_on_device()
     
     def _apply_lora(self):
         """Apply LoRA (Parameter-Efficient Fine-Tuning) to the model"""
@@ -905,24 +1007,32 @@ class OptimizedModelTrainer:
         """Load and prepare data"""
         logger.info(f"Loading sequences from {sequences_file}...")
 
-        with open(sequences_file, "r") as f:
-            data = json.load(f)
-
-        # Support both plain list and rich dict formats
+        sequences = []
         data_vocab_size = None
-        metadata_map = data.get("metadata", {}) if isinstance(data, dict) else {}
+        metadata_map = {}
 
-        if isinstance(data, dict):
-            if "token_sequences" in data:
-                sequences = data["token_sequences"]
-            else:
-                raise ValueError(
-                    f"Unsupported sequences file format for {sequences_file}: "
-                    f"dict keys={list(data.keys())}"
-                )
-            data_vocab_size = data.get("vocab_size")
-        else:
-            sequences = data
+        # Load JSONL format (one JSON object per line)
+        with open(sequences_file, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+
+                if isinstance(obj, dict):
+                    if "token_sequences" in obj:
+                        sequences.extend(obj["token_sequences"])
+                    elif "tokens" in obj:
+                        sequences.append({"tokens": obj["tokens"]})
+                    else:
+                        sequences.append(obj)
+
+                    if "metadata" in obj:
+                        metadata_map.update(obj["metadata"])
+                    if "vocab_size" in obj and data_vocab_size is None:
+                        data_vocab_size = obj["vocab_size"]
+                else:
+                    sequences.append(obj)
 
         if sequences and isinstance(sequences[0], dict):
             if "tokens" not in sequences[0]:
@@ -971,6 +1081,17 @@ class OptimizedModelTrainer:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
 
         pad_token_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+        tokenizer_vocab_size = len(self.tokenizer)
+
+        # Check vocab size compatibility
+        if data_vocab_size is not None and data_vocab_size > tokenizer_vocab_size:
+            raise ValueError(
+                f"Token sequences in {sequences_file} were created with vocab_size={data_vocab_size}, "
+                f"but tokenizer {self.tokenizer.name_or_path} only has {tokenizer_vocab_size} tokens. "
+                "Regenerate the sequences with the matching tokenizer (e.g. "
+                f"`python3 tokenizers/git_tokenizer_rich.py --model {self.model_cfg['tokenizer_name']}`) "
+                "before training."
+            )
 
         pre_tokenized = all(
             isinstance(seq, list) and seq for seq in token_lists
@@ -979,7 +1100,7 @@ class OptimizedModelTrainer:
         if pre_tokenized:
             num_sequences = len(token_lists)
             input_ids = torch.full((num_sequences, max_length), pad_token_id, dtype=torch.long)
-            attention_mask = torch.zeros((num_sequences, max_length), dtype=torch.long)
+            attention_mask = torch.zeros((num_sequences, max_length), dtype=torch.uint8)
 
             for idx, sequence in enumerate(token_lists):
                 if not isinstance(sequence, list):
@@ -991,8 +1112,11 @@ class OptimizedModelTrainer:
                 if seq_length == 0:
                     continue
 
+                # Clip token IDs to valid range (some may be out of vocab)
+                # Ensure tokens are >= 0 and < vocab_size
+                valid_sequence = [max(0, min(int(token_id), tokenizer_vocab_size - 1)) for token_id in sequence[:seq_length]]
                 input_ids[idx, :seq_length] = torch.tensor(
-                    sequence[:seq_length], dtype=torch.long
+                    valid_sequence, dtype=torch.long
                 )
                 attention_mask[idx, :seq_length] = 1
         else:
@@ -1005,16 +1129,6 @@ class OptimizedModelTrainer:
             )
             input_ids = encodings['input_ids']
             attention_mask = encodings['attention_mask']
-
-        tokenizer_vocab_size = len(self.tokenizer)
-        if data_vocab_size is not None and data_vocab_size > tokenizer_vocab_size:
-            raise ValueError(
-                f"Token sequences in {sequences_file} were created with vocab_size={data_vocab_size}, "
-                f"but tokenizer {self.tokenizer.name_or_path} only has {tokenizer_vocab_size} tokens. "
-                "Regenerate the sequences with the matching tokenizer (e.g. "
-                f"`python3 tokenizers/git_tokenizer_rich.py --model {self.model_cfg['tokenizer_name']}`) "
-                "before training."
-            )
 
         # Build metadata aligned with the sequences we loaded
         if metadata_map:

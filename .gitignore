@@ -81,3 +81,6 @@ dist/
 metal-backend/**/libflash_attn.dylib
 metal-backend/**/.dylibs/
 metal-backend/**/build/
+
+training_data_ELITE/
+training_data_the_block/
