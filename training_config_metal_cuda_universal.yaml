@@ -41,9 +41,10 @@ quantization:
   target_window: 64    # REDUCED for memory: 64 tokens target (still learn well)
 
 optimization:
-  # StarCoder 3B on 7.6GB CUDA: aggressive memory optimization WITHOUT quantization
-  batch_size: 1  # Batch 1 to minimize peak memory
-  gradient_accumulation_steps: 32  # Ultra-high accumulation = effective batch 32 (more stable convergence)
+  # MAXIMUM optimization for 2048-token sequences on RTX 2060 Super 8GB
+  batch_size: 1  # Batch 1 to minimize peak memory (no change)
+  gradient_accumulation_steps: 16  # Reduced from 32 → faster updates while maintaining stability
+  # Effective batch size: 16 (still excellent for convergence)
 
   # Learning rate optimized for StarCoder + LoRA rank 96
   learning_rate: 8.0e-4  # Slightly lower than GPT2, StarCoder is more stable
@@ -63,11 +64,11 @@ optimization:
 
 training:
   num_epochs: 20  # Train for 20 epochs (optimal for ELITE dataset size)
-  max_steps: 200000  # Failsafe: won't hit this with 20 epochs + 11.5K sequences
-  save_steps: 361  # Save after each epoch (~361 optimizer updates with batch 1, accum 32)
-  save_total_limit: 20  # Keep all 20 epoch checkpoints (no disk limit)
-  eval_steps: 91  # Evaluate every ~91 steps (~91 samples)
-  logging_steps: 45  # Log every 45 steps for detailed monitoring
+  max_steps: 200000  # Failsafe: won't hit this with 20 epochs + 142K sequences
+  save_steps: 8890  # Save after each epoch (142,239 seqs ÷ 16 accum = 8,890 steps/epoch)
+  save_total_limit: 20  # Keep all 20 epoch checkpoints (disk space permitting)
+  eval_steps: 890  # Evaluate every ~10% of epoch for detailed tracking
+  logging_steps: 100  # Log every 100 steps (every ~1% of epoch)
   seed: 42
 
   # EARLY STOPPING - conservative with StarCoder to avoid premature stopping
@@ -93,7 +94,7 @@ device_backend:
   attention_backend: "auto"
 
 output:
-  output_dir: "models/the-block-ELITE-test"
+  output_dir: "models/the-block-ELITE-2048ctx"  # Reflects maximum context window
   overwrite_output_dir: true  # Fresh start with new config
   save_model: true
-  save_optimizer: false
+  save_optimizer: false  # Save disk space (can resume from checkpoints)

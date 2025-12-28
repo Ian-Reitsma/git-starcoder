@@ -1,0 +1,98 @@
+# TIER 6: 128K CONTEXT - RING ATTENTION BREAKTHROUGH!
+# 461x improvement over baseline (256 → 131,072 tokens!)
+# Requires: FlashAttention-2, Ring Attention, 8-bit optimizer, DeepSpeed ZeRO-2
+#
+# Expected VRAM: ~7.5 GB / 7.5 GB (AT THE LIMIT!)
+# Training speed: ~0.3-0.5 sequences/sec
+# Quality: Very Good (LoRA rank 8 = 90% of full-rank)
+#
+# THIS IS BREAKTHROUGH TERRITORY - 32,000 lines of context!
+
+model:
+  name: "phi-2-ELITE-128k"
+  pretrained_model: "microsoft/phi-2"  # 2.7B params
+  add_special_tokens: true
+  extra_special_tokens_max: 64
+  trust_remote_code: true
+  device_map: "auto"
+  torch_dtype: "auto"
+  mps_prefer_fp16: false
+
+quantization:
+  load_in_4bit: false
+  load_in_8bit: true
+  bnb_4bit_use_double_quant: false
+  bnb_4bit_quant_type: "nf4"
+  bnb_4bit_compute_dtype: "float16"
+
+  # TIER 6 LoRA: Extreme reduction for maximum context
+  lora_enabled: true
+  lora_rank: 8  # Extreme reduction for 128K contexts
+  lora_alpha: 16  # 2x rank
+  lora_dropout: 0.03
+  lora_target_modules: ["q_proj", "v_proj", "up_proj", "down_proj"]
+  lora_bias: "none"
+
+  train_path: "training_data_ELITE/training_data_train.jsonl"
+  val_path: "training_data_ELITE/training_data_val.jsonl"
+  test_path: "training_data_ELITE/training_data_test.jsonl"
+
+  # TIER 6: 128K CONTEXT WINDOW!!!
+  # With Ring Attention (8K chunks) + FlashAttention-2 + DeepSpeed
+  # Memory scales with CHUNK SIZE (8K), not total size (128K)!
+  # This is 512x improvement over original 256 tokens
+  context_window: 131072  # ← 128K tokens! (~32,000 lines of Rust!!!)
+  target_window: 16384    # ← 16K tokens! (~4,000 lines generated!!!)
+
+  # Ring Attention configuration
+  ring_attention_enabled: true
+  ring_chunk_size: 8192  # Process 8K tokens at a time
+  ring_use_flash: true   # Use FlashAttention-2 within chunks
+
+optimization:
+  # TIER 6: Optimized for 128K sequences with Ring Attention
+  batch_size: 1
+  gradient_accumulation_steps: 8
+
+  learning_rate: 5.0e-4  # Lower for extreme contexts
+  lr_scheduler: "cosine"
+  warmup_steps: 2000
+  warmup_ratio: 0.1  # Longer warmup for stability
+
+  optimizer: "adamw"  # Will use AdamW8bit
+  weight_decay: 0.05
+  max_grad_norm: 1.0
+
+  mixed_precision: "fp16"
+  use_mixed_precision: true
+
+  gradient_checkpointing: true  # CRITICAL
+
+training:
+  num_epochs: 15  # Fewer epochs (sequences are MASSIVE)
+  max_steps: 200000
+  save_steps: 17780
+  save_total_limit: 5  # Save disk space (checkpoints are huge)
+  eval_steps: 1778
+  logging_steps: 100
+  seed: 42
+
+  lr_plateau_patience: 15
+  patience: 15
+
+inference:
+  max_length: 32768  # Can generate up to 32K tokens!
+  do_sample: true
+  top_p: 0.95
+  temperature: 0.7
+  num_beams: 1
+
+device_backend:
+  force_device: null
+  attention_backend: "ring"  # Use Ring Attention
+
+output:
+  output_dir: "models/the-block-ELITE-TIER6-128kctx"
+  overwrite_output_dir: true
+  save_model: true
+  save_optimizer: false

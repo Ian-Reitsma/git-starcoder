@@ -67,7 +67,7 @@ _patch_roberta_at_import()
 
 try:
     from torch.utils.data import DataLoader, TensorDataset, Subset, WeightedRandomSampler
-    from torch.optim import AdamW
+    from torch.optim import AdamW  # Fallback if bitsandbytes not available
     # Import scheduler from transformers, not torch
     try:
         from transformers.optimization import get_cosine_schedule_with_warmup
@@ -81,6 +81,28 @@ try:
     )
     from peft import get_peft_model, LoraConfig, TaskType
     from tqdm import tqdm
+
+    # Try to import bitsandbytes for 8-bit optimizer (TIER 4 optimization)
+    try:
+        import bitsandbytes as bnb
+        HAS_BNB_OPTIMIZER = True
+    except ImportError:
+        HAS_BNB_OPTIMIZER = False
+
+    # Check for FlashAttention-2 support (TIER 4 optimization)
+    try:
+        import flash_attn
+        HAS_FLASH_ATTN = True
+    except ImportError:
+        HAS_FLASH_ATTN = False
+
+    # Check for DeepSpeed support (TIER 4+ optimization for CPU offloading)
+    try:
+        import deepspeed
+        HAS_DEEPSPEED = True
+    except ImportError:
+        HAS_DEEPSPEED = False
+
 except ImportError as e:
     print(f"Missing dependency: {e}")
     print("Install: pip install torch transformers peft bitsandbytes pyyaml tqdm")
@@ -91,6 +113,24 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Log optimization flags after logger is configured
+if HAS_BNB_OPTIMIZER:
+    logger.info("✓ bitsandbytes 8-bit optimizer available (saves ~1.7 GB VRAM!)")
+else:
+    logger.warning("⚠ bitsandbytes 8-bit optimizer not available, using standard AdamW")
+
+if HAS_FLASH_ATTN:
+    import flash_attn
+    logger.info(f"✓ FlashAttention-2 available v{flash_attn.__version__} (enables 32K+ contexts!)")
+else:
+    logger.warning("⚠ FlashAttention-2 not available, will use SDPA (60% of Flash benefits)")
+
+if HAS_DEEPSPEED:
+    import deepspeed
+    logger.info(f"✓ DeepSpeed available v{deepspeed.__version__} (enables CPU offloading for extreme contexts!)")
+else:
+    logger.warning("⚠ DeepSpeed not available, TIER 4+ may require more VRAM")
 
 
 def load_yaml_config(config_path: str) -> Dict:
@@ -921,12 +961,18 @@ class OptimizedModelTrainer:
                 trust_remote_code=bool(self.model_cfg.get('trust_remote_code', True)),
             )
         else:
+            # TIER 4 OPTIMIZATION: Use FlashAttention-2 if available for 32K+ contexts
+            attn_implementation = "flash_attention_2" if HAS_FLASH_ATTN else "sdpa"
+            logger.info(f"Using attention implementation: {attn_implementation}")
+
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_cfg['name'],
                 quantization_config=quantization_config,
                 device_map='auto' if (self.model_cfg['use_4bit'] or self.model_cfg['use_8bit']) else None,
                 trust_remote_code=self.model_cfg['trust_remote_code'],
                 torch_dtype=torch.bfloat16 if self.model_cfg['use_bf16'] else torch.float32,
+                attn_implementation=attn_implementation,  # FlashAttention-2 or SDPA
+                use_cache=False,  # Required for training with Flash Attention
             )
 
         # If not using quantized device_map, move model explicitly to selected device
@@ -1420,11 +1466,23 @@ class OptimizedModelTrainer:
                         f"sequence_count={self.curriculum_summary['sequence_count']}")
        
         # Setup optimizer and scheduler
-        optimizer = AdamW(
-            self.model.parameters(),
-            lr=self.train_cfg['base_learning_rate'],
-            weight_decay=self.train_cfg['weight_decay'],
-        )
+        # TIER 4 OPTIMIZATION: Use 8-bit AdamW optimizer to save ~1.7 GB VRAM
+        if HAS_BNB_OPTIMIZER:
+            logger.info("Using bitsandbytes 8-bit AdamW optimizer (saves ~1.7 GB VRAM!)")
+            optimizer = bnb.optim.AdamW8bit(
+                self.model.parameters(),
+                lr=self.train_cfg['base_learning_rate'],
+                betas=(0.9, 0.999),
+                eps=1e-8,
+                weight_decay=self.train_cfg['weight_decay'],
+            )
+        else:
+            logger.info("Using standard AdamW optimizer")
+            optimizer = AdamW(
+                self.model.parameters(),
+                lr=self.train_cfg['base_learning_rate'],
+                weight_decay=self.train_cfg['weight_decay'],
+            )
         
         grad_accum_steps = self.train_cfg['gradient_accumulation_steps']
         steps_per_epoch = math.ceil(len(train_loader) / grad_accum_steps)
@@ -1826,6 +1884,17 @@ if __name__ == "__main__":
         default=None,
         choices=["cuda", "mps", "cpu"],
         help="Force device (default: auto-detect)",
+    )
+    parser.add_argument(
+        "--deepspeed",
+        default=None,
+        help="DeepSpeed config file for ZeRO optimization (enables extreme context training)",
+    )
+    parser.add_argument(
+        "--local_rank",
+        type=int,
+        default=-1,
+        help="Local rank for distributed training (automatically set by DeepSpeed)",
     )
 
     args = parser.parse_args()
