@@ -1,0 +1,101 @@
+# ULTRA-CONSERVATIVE CONFIG FOR 8GB GPU
+# This will work on RTX 2060 Super with 100% certainty
+# Prioritizes stability over performance
+
+model:
+  name: microsoft/phi-2
+  trust_remote_code: true
+
+optimization:
+  batch_size: 1
+  gradient_accumulation_steps: 256
+  gradient_checkpointing: true  # CRITICAL - saves 3x memory
+  mixed_precision: fp16
+  use_8bit_optimizer: true
+
+quantization:
+  bnb_4bit_compute_dtype: float16  # Not bfloat16 - more compatible
+  bnb_4bit_quant_type: nf4
+  bnb_4bit_use_double_quant: true
+  context_window: 512  # VERY small to guarantee it works
+  load_in_4bit: true
+  load_in_8bit: false
+  lora_alpha: 8
+  lora_dropout: 0.05
+  lora_plus_enabled: false  # Disabled - saves memory
+  lora_rank: 8  # VERY small - only 8 rank
+  target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - dense
+  target_window: 64  # VERY small target
+
+system:
+  allow_tf32: true
+  cpu_threads: 14
+  num_gpus: 1
+  use_deepspeed: false  # Disabled since it's not integrated properly
+  use_flash_attention: true
+
+training:
+  base_learning_rate: 0.0003
+  do_eval: true
+  eval_steps: 500
+  evaluation_strategy: steps
+  logging_steps: 10
+  max_grad_norm: 1.0
+  num_workers: 4
+  pin_memory: false  # Disabled - saves memory
+  save_steps: 500
+  save_total_limit: 2
+  validation_split: 0.1
+  warmup_ratio: 0.05
+  warmup_steps_min: 10
+  warmup_steps_max: 100
+  weight_decay: 0.01
+  lr_reduction_factor: 0.5
+  lr_plateau_patience: 2
+  min_delta: 0.001
+  gradient_accumulation_steps: 256
+
+  # All extra optimizations DISABLED to save memory
+  use_ema: false
+  use_ram_cache: false
+  prefetch_factor: 2
+  dataloader_workers_auto: false
+
+extreme_optimizations:
+  # ALL DISABLED - too aggressive for 8GB
+  activation_4bit_enabled: false
+  dynamic_curriculum_enabled: false
+  fused_kernels_enabled: false
+  gqa_enabled: false
+  paged_attention_enabled: false
+  powersgd_enabled: false
+  ring_attention_enabled: false
+  selective_checkpoint_enabled: false
+  sequence_packing_enabled: true  # Keep this - it's efficient
+  sequence_packing_utilization: 0.90
+
+ultra_optimizations:
+  activation_quantization_4bit:
+    enabled: false
+  checkpoint_pruning:
+    enabled: true
+    max_checkpoints: 2
+  dataset_staging:
+    enabled: false
+  early_stopping:
+    enabled: true
+    patience: 5
+    min_delta: 0.001
+  ema:
+    enabled: false
+  gradient_centralization:
+    enabled: false
+  gradient_noise:
+    enabled: false
+  lookahead:
+    enabled: false
+  torch_compile: false  # Disabled - can cause memory issues

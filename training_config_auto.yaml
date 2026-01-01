@@ -2,22 +2,19 @@ extreme_optimizations:
   activation_4bit_enabled: true
   activation_4bit_type: nf4
   dynamic_curriculum_enabled: true
-  dynamic_curriculum_schedule: &id001
-  - batch_size: 16
-    context: 8192
-    epochs: 1-1
+  dynamic_curriculum_schedule: &id002
   - batch_size: 8
-    context: 16384
-    epochs: 2-2
+    context: 8192
+    epochs: 1-2
   - batch_size: 4
-    context: 32768
-    epochs: 3-3
+    context: 16384
+    epochs: 3-5
   - batch_size: 2
-    context: 65536
-    epochs: 4-4
+    context: 32768
+    epochs: 6-9
   - batch_size: 1
-    context: 131072
-    epochs: 5-5
+    context: 65536
+    epochs: 10-15
   fused_kernels_backend: triton
   fused_kernels_enabled: true
   gqa_enabled: true
@@ -40,48 +37,88 @@ model:
 optimization:
   batch_size: 1
   gradient_accumulation_steps: 64
-  gradient_checkpointing: true
+  gradient_checkpointing: false
   mixed_precision: fp16
   use_8bit_optimizer: true
 quantization:
   bnb_4bit_compute_dtype: bfloat16
   bnb_4bit_quant_type: nf4
   bnb_4bit_use_double_quant: true
-  context_window: 131072
+  context_window: 65536
   load_in_4bit: true
   load_in_8bit: false
-  lora_alpha: 16
+  lora_alpha: 176
   lora_dropout: 0.05
   lora_plus_enabled: true
   lora_plus_lr_A: 0.0005
   lora_plus_lr_B: 0.008
   lora_plus_lr_ratio: 16.0
-  lora_rank: 8
+  lora_rank: 88
   target_modules:
   - q_proj
   - k_proj
   - v_proj
   - dense
-  target_window: 16384
+  target_window: 8192
 system:
+  allow_tf32: true
+  cpu_affinity: auto
+  cpu_threads: 14
+  interop_threads: 2
+  matmul_precision: high
   num_gpus: 1
+  numa_prefer_node: auto
+  storage_profile:
+    is_nvme: true
+    is_ssd: null
+    rotational: null
   use_deepspeed: true
   use_flash_attention: true
 training:
   base_learning_rate: 0.0005
+  cuda_graphs:
+    enabled: true
+    warmup_steps: 2
   curriculum_difficulty_schedule: linear
   curriculum_learning_enabled: true
   curriculum_start_ratio: 0.5
+  dataloader_workers_auto: true
+  dataset_staging: &id001
+    cache_on_staging: true
+    checksum_bytes: 4194304
+    checksum_enabled: true
+    checksum_mode: sample
+    enabled: true
+    keep_staged: true
+    min_dataset_mb: 512
+    min_free_gb: 4
+    prefer_ramdisk: true
+    staging_dir: null
   do_eval: true
   ema_decay: 0.999
   eval_steps: 500
   evaluation_strategy: steps
+  gradient_centralization: &id003
+    apply_to_conv: true
+    apply_to_fc: true
+    enabled: true
+  gradient_noise: &id004
+    enabled: true
+    eta: 0.3
+    gamma: 0.55
   greater_is_better: false
+  label_smoothing: &id005
+    enabled: true
+    smoothing: 0.1
   load_best_model_at_end: true
   logging_steps: 10
+  lookahead: &id006
+    alpha: 0.5
+    enabled: true
+    k: 5
   loss_spike_patience: 3
   loss_spike_threshold: 2.0
-  lr_scheduler_params: &id002
+  lr_scheduler_params: &id008
     anneal_strategy: cos
     div_factor: 25
     enabled: true
@@ -90,11 +127,50 @@ training:
     pct_start: 0.3
     type: one_cycle
   lr_scheduler_type: one_cycle
-  max_grad_norm: 0.5599999999999999
+  max_grad_norm: 0.9
+  memory_mapped_dataset: &id007
+    cache_dir: null
+    checksum_bytes: 4194304
+    checksum_enabled: true
+    checksum_mode: sample
+    dtype: int64
+    enabled: true
+    mode: auto
+    num_workers: 4
+    pack_target: auto
+    pack_target_max: 4096
+    pack_target_min: 256
+    prefetch_factor: 2
   metric_for_best_model: loss
+  num_workers: 14
+  num_workers_max: 14
+  num_workers_min: 4
+  pin_memory: true
+  pin_memory_device: cuda
+  prefetch_factor: 4
+  ram_cache_max_ratio: 0.8
   save_steps: 500
   save_total_limit: 3
+  swa: &id009
+    anneal_epochs: 5
+    anneal_strategy: cos
+    enabled: true
+    start_epoch: 10
+    swa_lr: null
+  throughput_probe:
+    batch_size_max: 16
+    batch_size_min: 1
+    enabled: true
+    favor_speed: true
+    joint_batch_pack: true
+    max_batch_candidates: 3
+    max_candidates: 3
+    max_combinations: 6
+    metric: tokens_per_sec
+    probe_steps: 2
+    warmup_steps: 1
   use_ema: true
+  use_ram_cache: true
   validation_split: 0.1
   warmup_ratio: 0.1
   weight_decay: 0.01
@@ -118,6 +194,7 @@ ultra_optimizations:
     - 15
     stages: 3
     strategy: sequence_length
+  dataset_staging: *id001
   defrag_schedule:
   - 1000
   - 2000
@@ -1119,11 +1196,11 @@ ultra_optimizations:
   - 998000
   - 999000
   dynamic_context_curriculum:
-    description: 'Dynamic curriculum: 5 stages over 5 epochs'
+    description: 'Dynamic curriculum: 4 stages over 15 epochs'
     enabled: true
-    final_context: 131072
-    num_stages: 5
-    schedule: *id001
+    final_context: 65536
+    num_stages: 4
+    schedule: *id002
     speedup: 1.4
   early_stopping:
     enabled: true
@@ -1146,14 +1223,8 @@ ultra_optimizations:
     - ffn
     memory_reduction: 0.2
     speedup: 1.25
-  gradient_centralization:
-    apply_to_conv: true
-    apply_to_fc: true
-    enabled: true
-  gradient_noise:
-    enabled: true
-    eta: 0.3
-    gamma: 0.55
+  gradient_centralization: *id003
+  gradient_noise: *id004
   gradient_variance:
     adjust_every: 500
     enabled: true
@@ -1169,13 +1240,8 @@ ultra_optimizations:
     enabled: true
     sink_tokens: 4
     sliding_window: 4096
-  label_smoothing:
-    enabled: true
-    smoothing: 0.1
-  lookahead:
-    alpha: 0.5
-    enabled: true
-    k: 5
+  label_smoothing: *id005
+  lookahead: *id006
   lora_plus:
     enabled: true
     lr_A: 0.0005
@@ -1194,11 +1260,8 @@ ultra_optimizations:
     min_lr: 1.0e-07
     num_iterations: 100
     smooth_f: 0.05
-  memory_mapped_dataset:
-    enabled: true
-    num_workers: 4
-    prefetch_factor: 2
-  one_cycle_lr: *id002
+  memory_mapped_dataset: *id007
+  one_cycle_lr: *id008
   paged_attention:
     block_size: 256
     description: Saves 0.12 GB - no fragmentation!
@@ -1242,12 +1305,7 @@ ultra_optimizations:
   smart_checkpoint_pruning:
     enabled: true
     keep_best_n: 3
-  swa:
-    anneal_epochs: 5
-    anneal_strategy: cos
-    enabled: true
-    start_epoch: 10
-    swa_lr: null
+  swa: *id009
   torch_compile: true
   validation_split: 0.1
   warmup_steps: 174

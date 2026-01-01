@@ -29,12 +29,17 @@ os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 import json
 import time
 import math
+import inspect
 import torch
 import logging
 import random
 import numpy as np
+import warnings
 import yaml
 import psutil
+import shutil
+import hashlib
+import torch.nn.functional as F
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Tuple, Optional
@@ -79,6 +84,11 @@ try:
     except ImportError:
         from transformers import get_cosine_schedule_with_warmup
     from torch.optim.lr_scheduler import ReduceLROnPlateau
+    try:
+        from torch.optim.swa_utils import AveragedModel, SWALR
+        HAS_SWA_UTILS = True
+    except Exception:
+        HAS_SWA_UTILS = False
     from transformers import (
         AutoModelForCausalLM,
         AutoTokenizer,
@@ -116,6 +126,18 @@ try:
     except ImportError:
         HAS_DEEPSPEED = False
 
+    # CPU LoRA offload toolkit (keeps adapters on pinned CPU memory)
+    try:
+        from cpu_offload_implementation import (
+            apply_cpu_offloaded_lora,
+            get_cpu_offload_parameters,
+            wrap_optimizer_for_cpu_offload,
+        )
+        HAS_CPU_LORA_OFFLOAD = True
+    except Exception as e:
+        HAS_CPU_LORA_OFFLOAD = False
+        _cpu_offload_import_error = e
+
 except ImportError as e:
     print(f"Missing dependency: {e}")
     print("Install: pip install torch transformers peft bitsandbytes pyyaml tqdm")
@@ -148,6 +170,13 @@ if HAS_DEEPSPEED:
     logger.info(f"✓ DeepSpeed available v{deepspeed.__version__} (enables CPU offloading for extreme contexts!)")
 else:
     logger.warning("⚠ DeepSpeed not available, TIER 4+ may require more VRAM")
+
+if HAS_CPU_LORA_OFFLOAD:
+    logger.info("✓ CPU LoRA offload module loaded (pin adapters on CPU, stage to GPU per step)")
+else:
+    logger.warning(f"⚠ CPU LoRA offload unavailable: {_cpu_offload_import_error}")
+if not HAS_SWA_UTILS:
+    logger.warning("⚠ SWA utilities unavailable; SWA will be disabled if configured")
 
 
 def load_yaml_config(config_path: str) -> Dict:
@@ -192,6 +221,80 @@ def set_seeds(seed: int = 42):
         torch.cuda.manual_seed_all(seed)
     logger.info(f"Seeds set to {seed}")
 
+
+class LookaheadOptimizer(torch.optim.Optimizer):
+    """Lookahead optimizer wrapper for improved convergence stability."""
+
+    def __init__(self, optimizer: torch.optim.Optimizer, k: int = 5, alpha: float = 0.5):
+        if k <= 0:
+            raise ValueError("Lookahead k must be > 0")
+        if not (0.0 < alpha <= 1.0):
+            raise ValueError("Lookahead alpha must be in (0, 1]")
+        super().__init__(optimizer.param_groups, optimizer.defaults)
+        self.optimizer = optimizer
+        self.k = int(k)
+        self.alpha = float(alpha)
+        self._lookahead_step = 0
+
+        # Mirror underlying optimizer metadata for schedulers.
+        self.defaults = optimizer.defaults
+        self.param_groups = optimizer.param_groups
+        self.state = optimizer.state
+
+        # Initialize slow weights in the optimizer state for each parameter.
+        for group in self.param_groups:
+            for p in group['params']:
+                if p is None:
+                    continue
+                state = self.state.setdefault(p, {})
+                if 'slow_param' not in state:
+                    slow = p.detach().clone()
+                    slow.requires_grad = False
+                    state['slow_param'] = slow
+
+    def step(self, closure=None):
+        loss = self.optimizer.step(closure)
+        self._lookahead_step += 1
+
+        if self._lookahead_step % self.k != 0:
+            return loss
+
+        for group in self.param_groups:
+            for p in group['params']:
+                if p is None or not p.requires_grad:
+                    continue
+                state = self.state.setdefault(p, {})
+                slow = state.get('slow_param')
+                if slow is None:
+                    slow = p.detach().clone()
+                    slow.requires_grad = False
+                    state['slow_param'] = slow
+                slow.add_(p.data - slow, alpha=self.alpha)
+                p.data.copy_(slow)
+
+        return loss
+
+    def zero_grad(self, *args, **kwargs):
+        return self.optimizer.zero_grad(*args, **kwargs)
+
+    def state_dict(self):
+        return {
+            'optimizer': self.optimizer.state_dict(),
+            'lookahead': {
+                'k': self.k,
+                'alpha': self.alpha,
+                'step': self._lookahead_step,
+            },
+        }
+
+    def load_state_dict(self, state_dict):
+        opt_state = state_dict.get('optimizer')
+        if opt_state is not None:
+            self.optimizer.load_state_dict(opt_state)
+        lookahead_state = state_dict.get('lookahead', {})
+        self.k = int(lookahead_state.get('k', self.k))
+        self.alpha = float(lookahead_state.get('alpha', self.alpha))
+        self._lookahead_step = int(lookahead_state.get('step', self._lookahead_step))
 
 class HardwareMonitor:
     """Monitor GPU/CPU/RAM/Thermal with time-based sampling"""
@@ -316,6 +419,24 @@ class CUDADataPrefetcher:
         return len(self.loader)
 
 
+class MemmapTokenDataset(torch.utils.data.Dataset):
+    """Memory-mapped token dataset (input_ids + attention_mask)."""
+
+    def __init__(self, input_ids_path: Path, attention_mask_path: Path, shape: Tuple[int, int],
+                 input_dtype: np.dtype, mask_dtype: np.dtype):
+        self.shape = shape
+        self.input_ids = np.memmap(str(input_ids_path), dtype=input_dtype, mode='r', shape=shape)
+        self.attention_mask = np.memmap(str(attention_mask_path), dtype=mask_dtype, mode='r', shape=shape)
+
+    def __len__(self):
+        return self.shape[0]
+
+    def __getitem__(self, idx: int):
+        input_ids = torch.from_numpy(self.input_ids[idx])
+        attention_mask = torch.from_numpy(self.attention_mask[idx])
+        return input_ids, attention_mask
+
+
 class OptimizedModelTrainer:
     """Unified trainer supporting multiple model architectures"""
     
@@ -368,6 +489,7 @@ class OptimizedModelTrainer:
         self.model_cfg = self.config['model']
         self.train_cfg = self.config['training']
         self.eval_cfg = self.config.get('evaluation', {})
+        self.system_cfg = self.config.get('system', {}) if isinstance(self.config.get('system', {}), dict) else {}
         self._normalize_training_config()
 
         # Device-specific overrides (important for MPS correctness)
@@ -423,16 +545,26 @@ class OptimizedModelTrainer:
 
         set_seeds(self.train_cfg['seed'])
 
+        # Apply system-level optimizations (CPU threads, matmul precision, TF32)
+        self._apply_system_optimizations()
+
         # 1% CUDA OPTIMIZATIONS for maximum throughput
         if torch.cuda.is_available():
             # Enable cudnn benchmark for auto-tuning (1.1-1.3x speedup)
             torch.backends.cudnn.benchmark = True
             # Enable TF32 for Ampere+ GPUs (2x faster matmul with minimal precision loss)
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
+            allow_tf32 = self.system_cfg.get('allow_tf32', True)
+            torch.backends.cuda.matmul.allow_tf32 = bool(allow_tf32)
+            torch.backends.cudnn.allow_tf32 = bool(allow_tf32)
+            if hasattr(torch.backends.cuda.matmul, "allow_fp16_reduced_precision_reduction"):
+                torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+            if hasattr(torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction"):
+                torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
             # Pre-allocate memory pool to avoid fragmentation
             torch.cuda.empty_cache()
-            logger.info("🚀 CUDA optimizations: cudnn.benchmark=True, TF32=True, memory pool cleared")
+            logger.info(
+                f"🚀 CUDA optimizations: cudnn.benchmark=True, TF32={bool(allow_tf32)}, memory pool cleared"
+            )
 
         # Apply MPS-specific optimizations if on Metal
         if self.device.type == 'mps':
@@ -450,12 +582,16 @@ class OptimizedModelTrainer:
         logger.info(f"Base Model: {self.model_cfg['name']}")
         logger.info(f"Device: {self.device}")
         logger.info(f"Use LoRA: {self.model_cfg['use_lora']}")
+        if self.model_cfg.get('use_lora', False):
+            logger.info(f"LoRA CPU offload: {self.model_cfg.get('cpu_offload_lora', False)}")
         logger.info(f"Use 4-bit: {self.model_cfg['use_4bit']}")
         logger.info(f"Use Mixed Precision: {self.train_cfg['use_mixed_precision']}")
         logger.info(f"="*70 + "\n")
         
         self.model = None
         self.tokenizer = None
+        self.use_deepspeed = False
+        self.deepspeed_engine = None
 
         # Eagerly initialize tokenizer so downstream code/tests can call trainer.tokenizer
         # without requiring model setup first.
@@ -470,6 +606,9 @@ class OptimizedModelTrainer:
 
         self.hardware_monitor = HardwareMonitor(self.config['hardware_monitoring']['collection_interval_seconds'])
         self.training_stats = {}
+        self._staged_files: Dict[str, str] = {}
+        self._staging_root: Optional[Path] = None
+        self.dataset_stats: Optional[Dict[str, float]] = None
 
     def _canonicalize_config(self, cfg: Any) -> Dict[str, Any]:
         """Upgrade config into the canonical schema expected by this trainer.
@@ -518,6 +657,9 @@ class OptimizedModelTrainer:
                 'use_8bit': bool(quant_in.get('load_in_8bit', False)),
                 'use_bf16': str(opt_in.get('mixed_precision', '')).lower() in ('bf16', 'bfloat16'),
                 'use_fp16': str(opt_in.get('mixed_precision', '')).lower() in ('fp16', 'float16'),
+                'cpu_offload_lora': bool(
+                    opt_in.get('cpu_offload_lora', False) or quant_in.get('cpu_offload_lora', False)
+                ),
                 # MPS passthrough knobs (alternate schema)
                 'mps_prefer_fp16': bool(model_in.get('mps_prefer_fp16', False)),
                 'mps_quant_dtype': quant_in.get('mps_quant_dtype', model_in.get('mps_quant_dtype')),
@@ -553,17 +695,34 @@ class OptimizedModelTrainer:
                 'lr_plateau_patience': int(train_in.get('lr_plateau_patience', 2)),
                 'min_delta': float(train_in.get('min_delta', 0.0)),
                 'pin_memory': bool(train_in.get('pin_memory', True)),
+                'pin_memory_device': train_in.get('pin_memory_device'),
                 'batch_size_reference': batch,
                 'batch_size_large': batch,
                 'batch_size_medium': batch,
                 'batch_size_small': batch,
+                'batch_size_override': train_in.get('batch_size_override'),
                 'num_workers': int(train_in.get('num_workers', 0)),
                 'num_workers_min': int(train_in.get('num_workers_min', 0)),
                 'num_workers_max': int(train_in.get('num_workers_max', 0)),
+                'dataloader_workers_auto': bool(train_in.get('dataloader_workers_auto', True)),
+                'prefetch_factor': int(train_in.get('prefetch_factor', 4)),
+                'use_ram_cache': bool(train_in.get('use_ram_cache', True)),
+                'ram_cache_max_ratio': float(train_in.get('ram_cache_max_ratio', 0.5)),  # fraction of available RAM allowed
                 'incremental_context_sequences': int(train_in.get('incremental_context_sequences', 2)),
                 'drop_full_attention_mask': bool(train_in.get('drop_full_attention_mask', True)),
                 'deterministic_mode': bool(train_in.get('deterministic_mode', False)),
+                'memory_mapped_dataset': train_in.get('memory_mapped_dataset', {}),
+                'dataset_staging': train_in.get('dataset_staging', {}),
+                'throughput_probe': train_in.get('throughput_probe', {}),
+                'cuda_graphs': train_in.get('cuda_graphs', {}),
+                'label_smoothing': train_in.get('label_smoothing', {}),
+                'gradient_noise': train_in.get('gradient_noise', {}),
+                'gradient_centralization': train_in.get('gradient_centralization', {}),
+                'swa': train_in.get('swa', {}),
+                'lookahead': train_in.get('lookahead', {}),
             }
+
+            system_cfg = cfg.get('system', {}) if isinstance(cfg.get('system', {}), dict) else {}
 
             canonical = {
                 'model': model_cfg,
@@ -578,6 +737,7 @@ class OptimizedModelTrainer:
                     'save_final_model': bool(out_in.get('save_model', True)),
                 }),
                 'device_backend': cfg.get('device_backend', {}),
+                'system': system_cfg,
             }
             return canonical
 
@@ -591,6 +751,7 @@ class OptimizedModelTrainer:
             'evaluation': cfg.get('evaluation', {}),
             'model_saving': cfg.get('model_saving', {}),
             'device_backend': cfg.get('device_backend', {}),
+            'system': cfg.get('system', {}) if isinstance(cfg.get('system', {}), dict) else {},
         }
 
     def _init_synthetic_model_and_tokenizer(self) -> None:
@@ -821,6 +982,146 @@ class OptimizedModelTrainer:
             if key in self.train_cfg and isinstance(self.train_cfg[key], str):
                 self.train_cfg[key] = self.train_cfg[key].lower() in ('true', '1', 'yes')
 
+    def _apply_system_optimizations(self):
+        """Maximize CPU/GPU utilization based on system config."""
+        if not isinstance(self.system_cfg, dict):
+            return
+
+        cpu_threads = self.system_cfg.get('cpu_threads')
+        interop_threads = self.system_cfg.get('interop_threads')
+        matmul_precision = self.system_cfg.get('matmul_precision')
+        cpu_affinity = self.system_cfg.get('cpu_affinity')
+        numa_prefer_node = self.system_cfg.get('numa_prefer_node')
+
+        if cpu_threads:
+            try:
+                cpu_threads = int(cpu_threads)
+                for env_var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+                    os.environ.setdefault(env_var, str(cpu_threads))
+                torch.set_num_threads(cpu_threads)
+                logger.info(f"CPU threads set to {cpu_threads} (compute)")
+            except Exception as e:
+                logger.warning(f"Could not set CPU threads: {e}")
+
+        if interop_threads:
+            try:
+                interop_threads = int(interop_threads)
+                torch.set_num_interop_threads(interop_threads)
+                logger.info(f"Interop threads set to {interop_threads}")
+            except Exception as e:
+                logger.warning(f"Could not set interop threads: {e}")
+
+        if matmul_precision and hasattr(torch, "set_float32_matmul_precision"):
+            try:
+                torch.set_float32_matmul_precision(str(matmul_precision))
+                logger.info(f"Float32 matmul precision set to {matmul_precision}")
+            except Exception as e:
+                logger.warning(f"Could not set matmul precision: {e}")
+
+        if torch.cuda.is_available():
+            allow_tf32 = self.system_cfg.get('allow_tf32')
+            if allow_tf32 is not None:
+                try:
+                    torch.backends.cuda.matmul.allow_tf32 = bool(allow_tf32)
+                    torch.backends.cudnn.allow_tf32 = bool(allow_tf32)
+                    logger.info(f"TF32 allowed: {bool(allow_tf32)}")
+                except Exception as e:
+                    logger.warning(f"Could not set TF32 flags: {e}")
+
+        # CPU affinity / NUMA pinning (Linux only, safe no-op elsewhere)
+        if cpu_affinity or numa_prefer_node:
+            if hasattr(os, "sched_setaffinity"):
+                try:
+                    available = sorted(os.sched_getaffinity(0))
+                    target_cpus = self._select_affinity_cpus(
+                        available,
+                        cpu_affinity=cpu_affinity,
+                        numa_prefer_node=numa_prefer_node,
+                        cpu_threads=cpu_threads,
+                    )
+                    if target_cpus:
+                        os.sched_setaffinity(0, set(target_cpus))
+                        logger.info(f"CPU affinity pinned to {len(target_cpus)} cores")
+                except Exception as e:
+                    logger.warning(f"Could not set CPU affinity: {e}")
+            else:
+                logger.info("CPU affinity not supported on this platform")
+
+    @staticmethod
+    def _parse_cpu_list(cpu_list: str) -> List[int]:
+        cpus: List[int] = []
+        for part in cpu_list.split(','):
+            part = part.strip()
+            if not part:
+                continue
+            if '-' in part:
+                start, end = part.split('-', 1)
+                try:
+                    for cpu in range(int(start), int(end) + 1):
+                        cpus.append(cpu)
+                except ValueError:
+                    continue
+            else:
+                try:
+                    cpus.append(int(part))
+                except ValueError:
+                    continue
+        return sorted(set(cpus))
+
+    def _numa_node_cpu_map(self) -> Dict[int, List[int]]:
+        nodes: Dict[int, List[int]] = {}
+        sys_nodes = Path("/sys/devices/system/node")
+        if not sys_nodes.exists():
+            return nodes
+        for node_dir in sys_nodes.glob("node[0-9]*"):
+            try:
+                node_idx = int(node_dir.name.replace("node", ""))
+                cpulist_path = node_dir / "cpulist"
+                if not cpulist_path.exists():
+                    continue
+                cpus = self._parse_cpu_list(cpulist_path.read_text().strip())
+                if cpus:
+                    nodes[node_idx] = cpus
+            except Exception:
+                continue
+        return nodes
+
+    def _select_affinity_cpus(
+        self,
+        available: List[int],
+        cpu_affinity: Optional[object],
+        numa_prefer_node: Optional[object],
+        cpu_threads: Optional[int],
+    ) -> List[int]:
+        if not available:
+            return []
+
+        nodes = self._numa_node_cpu_map()
+        node_cpus: Optional[List[int]] = None
+
+        if isinstance(numa_prefer_node, int):
+            node_cpus = nodes.get(numa_prefer_node)
+        elif isinstance(numa_prefer_node, str) and numa_prefer_node.lower() == "auto":
+            if nodes:
+                node_cpus = max(nodes.values(), key=len)
+
+        if isinstance(cpu_affinity, list):
+            target = [c for c in cpu_affinity if c in available]
+        elif isinstance(cpu_affinity, str):
+            lower = cpu_affinity.lower()
+            if lower == "auto":
+                base = node_cpus if node_cpus else available
+                limit = int(cpu_threads) if cpu_threads else len(base)
+                target = base[: max(1, limit)]
+            elif lower == "all":
+                target = available
+            else:
+                target = available
+        else:
+            target = node_cpus if node_cpus else available
+
+        return sorted(set(target))
+
     def _load_training_info(self, output_dir: Path) -> Dict[str, Any]:
         """Load persisted training metadata from the output directory"""
         info_path = output_dir / "training_info.json"
@@ -933,6 +1234,988 @@ class OptimizedModelTrainer:
             "latest_sequence_commit_idx": self.latest_commit_idx,
         }
 
+    def _detect_storage_profile(self, path: Path) -> Dict[str, Optional[bool]]:
+        profile = {
+            'is_ssd': None,
+            'is_nvme': None,
+            'rotational': None,
+        }
+        try:
+            probe_path = path if path.exists() else path.parent
+            dev = os.stat(probe_path).st_dev
+            sys_block = Path(f"/sys/dev/block/{os.major(dev)}:{os.minor(dev)}")
+            if not sys_block.exists():
+                return profile
+            sys_resolved = sys_block.resolve()
+            profile['is_nvme'] = "nvme" in str(sys_resolved)
+            rotational_path = sys_resolved / "queue" / "rotational"
+            if rotational_path.exists():
+                rotational = int(rotational_path.read_text().strip())
+                profile['rotational'] = rotational
+                profile['is_ssd'] = rotational == 0
+        except Exception:
+            return profile
+        return profile
+
+    def _checksum_settings(self, cfg: Dict[str, Any]) -> Tuple[bool, str, int]:
+        enabled = bool(cfg.get('checksum_enabled', True))
+        mode = str(cfg.get('checksum_mode', 'sample')).lower()
+        sample_bytes = int(cfg.get('checksum_bytes', 4 * 1024 * 1024))
+        return enabled, mode, sample_bytes
+
+    def _compute_file_checksum(self, path: Path, mode: str, sample_bytes: int) -> str:
+        h = hashlib.sha256()
+        size = path.stat().st_size
+        if mode == "full" or size <= sample_bytes:
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    h.update(chunk)
+        else:
+            head = min(sample_bytes // 2, size)
+            tail = min(sample_bytes - head, max(0, size - head))
+            with open(path, "rb") as f:
+                if head:
+                    h.update(f.read(head))
+                if tail:
+                    f.seek(-tail, os.SEEK_END)
+                    h.update(f.read(tail))
+        return h.hexdigest()
+
+    def _select_staging_dir(self, source_path: Path, staging_cfg: Dict[str, Any]) -> Optional[Path]:
+        prefer_ramdisk = bool(staging_cfg.get('prefer_ramdisk', True))
+        explicit_dir = staging_cfg.get('staging_dir')
+        min_free_gb = float(staging_cfg.get('min_free_gb', 4))
+
+        candidates: List[Path] = []
+        if explicit_dir:
+            candidates.append(Path(explicit_dir))
+        if prefer_ramdisk and Path("/dev/shm").exists():
+            candidates.append(Path("/dev/shm"))
+        candidates.append(Path("/tmp"))
+
+        source_profile = self._detect_storage_profile(source_path)
+
+        for candidate in candidates:
+            if not candidate.exists():
+                continue
+            try:
+                usage = shutil.disk_usage(candidate)
+                if usage.free < min_free_gb * (1024 ** 3):
+                    continue
+                candidate_profile = self._detect_storage_profile(candidate)
+                if prefer_ramdisk and candidate == Path("/dev/shm"):
+                    return candidate
+                if source_profile.get('rotational') == 1 and candidate_profile.get('is_ssd'):
+                    return candidate
+                if explicit_dir and candidate == Path(explicit_dir):
+                    return candidate
+            except Exception:
+                continue
+        return None
+
+    def _stage_dataset_if_needed(self, sequences_file: str) -> str:
+        staging_cfg = self.train_cfg.get('dataset_staging', {})
+        if not isinstance(staging_cfg, dict) or not staging_cfg.get('enabled', False):
+            return sequences_file
+
+        source_path = Path(sequences_file)
+        if not source_path.exists():
+            return sequences_file
+
+        if sequences_file in self._staged_files:
+            return self._staged_files[sequences_file]
+
+        min_size_mb = float(staging_cfg.get('min_dataset_mb', 512))
+        if source_path.stat().st_size < min_size_mb * (1024 ** 2):
+            return sequences_file
+
+        staging_root = self._select_staging_dir(source_path, staging_cfg)
+        if staging_root is None:
+            return sequences_file
+
+        try:
+            staging_root.mkdir(parents=True, exist_ok=True)
+            staged_path = staging_root / source_path.name
+            metadata_path = staged_path.with_suffix(staged_path.suffix + ".stage.json")
+            checksum_enabled, checksum_mode, checksum_bytes = self._checksum_settings(staging_cfg)
+
+            if staged_path.exists() and staging_cfg.get('keep_staged', True):
+                reuse_ok = True
+                if metadata_path.exists():
+                    try:
+                        meta = json.loads(metadata_path.read_text())
+                        if meta.get("source_mtime") != source_path.stat().st_mtime:
+                            reuse_ok = False
+                        if meta.get("source_size") != source_path.stat().st_size:
+                            reuse_ok = False
+                        if checksum_enabled:
+                            current_checksum = self._compute_file_checksum(
+                                source_path, checksum_mode, checksum_bytes
+                            )
+                            if meta.get("source_checksum") != current_checksum:
+                                reuse_ok = False
+                    except Exception:
+                        reuse_ok = False
+                elif checksum_enabled:
+                    reuse_ok = False
+
+                if reuse_ok:
+                    self._staged_files[sequences_file] = str(staged_path)
+                    self._staging_root = staging_root
+                    logger.info(f"Dataset already staged at {staged_path}")
+                    return str(staged_path)
+
+            shutil.copy2(source_path, staged_path)
+            metadata = {
+                "source_path": str(source_path),
+                "source_mtime": source_path.stat().st_mtime,
+                "source_size": source_path.stat().st_size,
+                "checksum_mode": checksum_mode,
+                "checksum_bytes": checksum_bytes,
+            }
+            if checksum_enabled:
+                metadata["source_checksum"] = self._compute_file_checksum(
+                    source_path, checksum_mode, checksum_bytes
+                )
+            metadata_path.write_text(json.dumps(metadata, indent=2))
+            self._staged_files[sequences_file] = str(staged_path)
+            self._staging_root = staging_root
+            logger.info(f"Dataset staged to {staged_path}")
+            return str(staged_path)
+        except Exception as e:
+            logger.warning(f"Dataset staging failed: {e}")
+            return sequences_file
+
+    def _is_pretokenized_jsonl(self, sequences_file: str) -> bool:
+        try:
+            with open(sequences_file, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    obj = json.loads(line)
+                    if isinstance(obj, dict):
+                        if "token_sequences" in obj and obj["token_sequences"]:
+                            return isinstance(obj["token_sequences"][0], list)
+                        if "tokens" in obj:
+                            return isinstance(obj["tokens"], list)
+                    if isinstance(obj, list):
+                        return True
+            return False
+        except Exception:
+            return False
+
+    def _iter_token_sequences(self, sequences_file: str, start_idx: int = 0):
+        idx = 0
+        with open(sequences_file, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                sequences = []
+                if isinstance(obj, dict):
+                    if "token_sequences" in obj:
+                        sequences = obj["token_sequences"]
+                    elif "tokens" in obj:
+                        sequences = [obj["tokens"]]
+                elif isinstance(obj, list):
+                    sequences = [obj]
+
+                for seq in sequences:
+                    if not isinstance(seq, list):
+                        continue
+                    if idx >= start_idx:
+                        yield seq
+                    idx += 1
+
+    def _next_pow2(self, value: int) -> int:
+        if value <= 0:
+            return 1
+        return 1 << (value - 1).bit_length()
+
+    def _profile_sequence_lengths(
+        self,
+        sequences_file: str,
+        start_idx: int = 0,
+        max_samples: int = 20000,
+    ) -> Dict[str, float]:
+        """Stream length stats without loading full dataset into RAM."""
+        import random
+
+        lengths: List[int] = []
+        total = 0
+        max_len = 0
+        for seq in self._iter_token_sequences(sequences_file, start_idx=start_idx):
+            total += 1
+            seq_len = len(seq)
+            if seq_len > max_len:
+                max_len = seq_len
+            if len(lengths) < max_samples:
+                lengths.append(seq_len)
+            else:
+                # Reservoir sampling
+                j = random.randint(0, total - 1)
+                if j < max_samples:
+                    lengths[j] = seq_len
+
+        if not lengths:
+            return {
+                'count': 0,
+                'avg': 0.0,
+                'p50': 0.0,
+                'p90': 0.0,
+                'p95': 0.0,
+                'p99': 0.0,
+                'max': 0.0,
+            }
+
+        lengths_sorted = sorted(lengths)
+        def _pct(p: float) -> float:
+            idx = min(len(lengths_sorted) - 1, int(round(p * (len(lengths_sorted) - 1))))
+            return float(lengths_sorted[idx])
+
+        avg_len = float(sum(lengths_sorted)) / len(lengths_sorted)
+        return {
+            'count': total,
+            'avg': avg_len,
+            'p50': _pct(0.50),
+            'p90': _pct(0.90),
+            'p95': _pct(0.95),
+            'p99': _pct(0.99),
+            'max': float(max_len),
+        }
+
+    def _peek_vocab_size(self, sequences_file: str) -> Optional[int]:
+        try:
+            with open(sequences_file, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    obj = json.loads(line)
+                    if isinstance(obj, dict) and "vocab_size" in obj:
+                        return int(obj["vocab_size"])
+        except Exception:
+            return None
+        return None
+
+    def _auto_pack_target(self, stats: Optional[Dict[str, float]] = None,
+                          mmap_cfg: Optional[Dict[str, Any]] = None) -> int:
+        gpu_compute_cap = 0.0
+        if torch.cuda.is_available():
+            gpu_compute_cap = torch.cuda.get_device_capability()[0] + torch.cuda.get_device_capability()[1] / 10
+        min_target = 256
+        max_target = 4096
+        if mmap_cfg:
+            min_target = int(mmap_cfg.get('pack_target_min', min_target))
+            max_target = int(mmap_cfg.get('pack_target_max', max_target))
+
+        if gpu_compute_cap >= 8.0:
+            base = 2048
+        elif gpu_compute_cap >= 7.5:
+            base = 256
+        else:
+            base = 256
+
+        if not stats:
+            return max(min_target, min(max_target, base))
+
+        p95 = int(stats.get('p95', base))
+        target = self._next_pow2(p95)
+        target = max(min_target, min(max_target, target))
+        return max(min_target, min(max_target, max(target, base)))
+
+    def _probe_seq_len(self, seq_len: int, batch_size: int,
+                       warmup_steps: int, probe_steps: int) -> Optional[float]:
+        """Measure forward+backward time for a given seq_len (seconds/step)."""
+        if not torch.cuda.is_available():
+            return None
+        if self.model is None:
+            return None
+
+        device = self.device
+        vocab = 32000
+        if self.tokenizer is not None:
+            vocab = len(self.tokenizer)
+
+        input_ids = torch.randint(0, vocab, (batch_size, seq_len), device=device)
+        attention_mask = torch.ones((batch_size, seq_len), device=device, dtype=torch.long)
+        labels = input_ids.clone()
+
+        use_autocast = bool(self.train_cfg.get('use_mixed_precision', True)) and self.device.type == "cuda"
+
+        try:
+            self.model.train()
+            torch.cuda.synchronize()
+            for _ in range(max(0, warmup_steps)):
+                self.model.zero_grad(set_to_none=True)
+                with torch.amp.autocast(device_type="cuda", enabled=use_autocast):
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                    )
+                    loss = outputs.loss
+                loss.backward()
+            torch.cuda.synchronize()
+
+            start = time.time()
+            for _ in range(max(1, probe_steps)):
+                self.model.zero_grad(set_to_none=True)
+                with torch.amp.autocast(device_type="cuda", enabled=use_autocast):
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                    )
+                    loss = outputs.loss
+                loss.backward()
+            torch.cuda.synchronize()
+            self.model.zero_grad(set_to_none=True)
+            elapsed = time.time() - start
+            return elapsed / max(1, probe_steps)
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                torch.cuda.empty_cache()
+                return None
+            raise
+
+    def _batch_size_candidates_for_probe(
+        self,
+        seq_len: int,
+        probe_cfg: Dict[str, Any],
+    ) -> List[int]:
+        explicit = probe_cfg.get('batch_size_candidates') or probe_cfg.get('batch_sizes')
+        if explicit:
+            if isinstance(explicit, str):
+                explicit = [p.strip() for p in explicit.split(',') if p.strip()]
+            try:
+                candidates = [int(x) for x in explicit]
+            except Exception:
+                candidates = []
+        else:
+            candidates = []
+
+        min_bs = int(probe_cfg.get('batch_size_min', 1))
+        max_bs = int(probe_cfg.get('batch_size_max', 16))
+        try:
+            max_est = self._get_batch_size(seq_len, log=False)
+        except Exception:
+            max_est = max_bs
+        max_bs = max(min_bs, min(max_bs, max_est))
+
+        if not candidates:
+            ref = int(self.train_cfg.get('batch_size_reference', max(1, min(2, max_bs))))
+            candidates = {ref, max(1, ref // 2), min(max_bs, ref * 2), max_bs, 1}
+            bs = 1
+            while bs <= max_bs:
+                candidates.add(bs)
+                bs *= 2
+            candidates = sorted(candidates)
+
+        filtered = [int(c) for c in candidates if min_bs <= int(c) <= max_bs]
+        filtered = sorted(set(filtered))
+
+        max_candidates = int(probe_cfg.get('max_batch_candidates', 3))
+        favor_speed = bool(probe_cfg.get('favor_speed', True))
+        if max_candidates > 0 and len(filtered) > max_candidates:
+            filtered = sorted(filtered, reverse=favor_speed)[:max_candidates]
+            filtered = sorted(set(filtered), reverse=favor_speed)
+
+        return filtered if filtered else [max(1, min_bs)]
+
+    def _select_pack_target_and_batch_from_probe(
+        self,
+        seq_candidates: List[int],
+        batch_candidates: List[int],
+        probe_cfg: Dict[str, Any],
+    ) -> Optional[Tuple[int, int]]:
+        enabled = bool(probe_cfg.get('enabled', False)) and bool(probe_cfg.get('joint_batch_pack', False))
+        if not enabled or not seq_candidates or not batch_candidates:
+            return None
+        if not torch.cuda.is_available() or self.model is None:
+            return None
+
+        warmup_steps = int(probe_cfg.get('warmup_steps', 1))
+        probe_steps = int(probe_cfg.get('probe_steps', 2))
+        metric = str(probe_cfg.get('metric', 'tokens_per_sec')).lower()
+        max_combos = int(probe_cfg.get('max_combinations', 6))
+
+        combos = [(s, b) for s in seq_candidates for b in batch_candidates]
+        if max_combos > 0 and len(combos) > max_combos:
+            combos = combos[:max_combos]
+
+        best = None
+        best_score = None
+
+        for seq_len, batch_size in combos:
+            step_time = self._probe_seq_len(seq_len, batch_size, warmup_steps, probe_steps)
+            if step_time is None or step_time <= 0:
+                logger.info(f"Throughput probe: seq_len {seq_len} batch {batch_size} OOM/unavailable")
+                continue
+            it_per_sec = 1.0 / step_time
+            tokens_per_sec = (seq_len * batch_size) / step_time
+            score = tokens_per_sec if metric != 'it_per_sec' else it_per_sec
+            logger.info(
+                f"Throughput probe: seq_len {seq_len} batch {batch_size} → "
+                f"{it_per_sec:.2f} it/s ({tokens_per_sec/1e6:.2f} Mtok/s)"
+            )
+            if best_score is None or score > best_score:
+                best_score = score
+                best = (seq_len, batch_size)
+
+        return best
+
+    def _select_pack_target_from_probe(
+        self,
+        candidates: List[int],
+        batch_size: int,
+        probe_cfg: Dict[str, Any],
+    ) -> Optional[int]:
+        if not candidates:
+            return None
+        enabled = bool(probe_cfg.get('enabled', False))
+        if not enabled:
+            return None
+        if not torch.cuda.is_available() or self.model is None:
+            return None
+
+        warmup_steps = int(probe_cfg.get('warmup_steps', 1))
+        probe_steps = int(probe_cfg.get('probe_steps', 2))
+
+        best_target = None
+        best_time = None
+        for seq_len in candidates:
+            step_time = self._probe_seq_len(seq_len, batch_size, warmup_steps, probe_steps)
+            if step_time is None:
+                logger.info(f"Throughput probe: seq_len {seq_len} OOM or unavailable")
+                continue
+            logger.info(f"Throughput probe: seq_len {seq_len} → {step_time:.4f}s/step")
+            if best_time is None or step_time < best_time:
+                best_time = step_time
+                best_target = seq_len
+
+        return best_target
+
+    def _setup_cuda_graph(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        labels: torch.Tensor,
+        use_autocast: bool,
+        warmup_steps: int,
+        label_smoothing: float,
+    ) -> Optional[Dict[str, Any]]:
+        if not torch.cuda.is_available() or self.model is None:
+            return None
+
+        try:
+            static_input_ids = input_ids.detach().clone()
+            static_attention_mask = attention_mask.detach().clone() if attention_mask is not None else None
+            static_labels = labels.detach().clone()
+
+            torch.cuda.synchronize()
+            for _ in range(max(0, warmup_steps)):
+                self.model.zero_grad(set_to_none=True)
+                with torch.amp.autocast(device_type="cuda", enabled=use_autocast):
+                    outputs = self.model(
+                        input_ids=static_input_ids,
+                        attention_mask=static_attention_mask,
+                        labels=static_labels,
+                    )
+                    if label_smoothing > 0:
+                        logits = outputs.logits
+                        loss = F.cross_entropy(
+                            logits.view(-1, logits.size(-1)),
+                            static_labels.view(-1),
+                            label_smoothing=label_smoothing,
+                            ignore_index=-100,
+                        )
+                    else:
+                        loss = outputs.loss
+                loss.backward()
+            torch.cuda.synchronize()
+            self.model.zero_grad(set_to_none=True)
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                with torch.amp.autocast(device_type="cuda", enabled=use_autocast):
+                    outputs = self.model(
+                        input_ids=static_input_ids,
+                        attention_mask=static_attention_mask,
+                        labels=static_labels,
+                    )
+                    if label_smoothing > 0:
+                        logits = outputs.logits
+                        loss = F.cross_entropy(
+                            logits.view(-1, logits.size(-1)),
+                            static_labels.view(-1),
+                            label_smoothing=label_smoothing,
+                            ignore_index=-100,
+                        )
+                    else:
+                        loss = outputs.loss
+                loss = loss / self.train_cfg['gradient_accumulation_steps']
+                loss.backward()
+
+            return {
+                'graph': graph,
+                'static_input_ids': static_input_ids,
+                'static_attention_mask': static_attention_mask,
+                'static_labels': static_labels,
+                'loss': loss,
+            }
+        except Exception as exc:
+            logger.warning(f"CUDA graph setup failed: {exc}")
+            torch.cuda.empty_cache()
+            return None
+
+    def _apply_gradient_noise(self, step: int) -> None:
+        cfg = self.train_cfg.get('gradient_noise', {}) if isinstance(self.train_cfg, dict) else {}
+        if not isinstance(cfg, dict) or not cfg.get('enabled', False):
+            return
+        eta = float(cfg.get('eta', 0.3))
+        gamma = float(cfg.get('gamma', 0.55))
+        noise_scale = eta / max(1.0, (step + 1) ** gamma)
+
+        for p in self.model.parameters():
+            if p.grad is None:
+                continue
+            p.grad.add_(torch.randn_like(p.grad) * noise_scale)
+
+    def _apply_gradient_centralization(self) -> None:
+        cfg = self.train_cfg.get('gradient_centralization', {}) if isinstance(self.train_cfg, dict) else {}
+        if not isinstance(cfg, dict) or not cfg.get('enabled', False):
+            return
+
+        for p in self.model.parameters():
+            if p.grad is None:
+                continue
+            if p.grad.dim() <= 1:
+                continue
+            dims = tuple(range(1, p.grad.dim()))
+            p.grad.sub_(p.grad.mean(dim=dims, keepdim=True))
+
+    def _estimate_ram_bytes(self, num_sequences: int, seq_len: int, dtype: str) -> int:
+        dtype_bytes = 8 if str(dtype).lower() == "int64" else 4
+        input_bytes = num_sequences * seq_len * dtype_bytes
+        mask_bytes = num_sequences * seq_len * 1
+        return int((input_bytes + mask_bytes) * 1.1)
+
+    def _should_use_memmap(
+        self,
+        mmap_cfg: Dict[str, Any],
+        stats: Dict[str, float],
+        seq_len: int,
+        packed_count: Optional[int] = None,
+    ) -> bool:
+        mode = str(mmap_cfg.get('mode', 'auto')).lower()
+        if mode == 'off':
+            return False
+        if mode == 'force':
+            return True
+
+        available_ram = psutil.virtual_memory().available
+        ratio_limit = float(self.train_cfg.get('ram_cache_max_ratio', 0.5))
+        budget = available_ram * ratio_limit
+        num_sequences = packed_count if packed_count is not None else int(stats.get('count', 0))
+        est_bytes = self._estimate_ram_bytes(num_sequences, seq_len, mmap_cfg.get('dtype', 'int64'))
+        return est_bytes > budget
+
+    def _count_sequences(self, sequences_file: str, start_idx: int = 0) -> Tuple[int, int]:
+        count = 0
+        max_len = 0
+        for seq in self._iter_token_sequences(sequences_file, start_idx=start_idx):
+            count += 1
+            if len(seq) > max_len:
+                max_len = len(seq)
+        return count, max_len
+
+    def _count_packed_sequences(self, sequences_file: str, target_length: int,
+                                 start_idx: int = 0) -> int:
+        packs = 0
+        current_len = 0
+        for seq in self._iter_token_sequences(sequences_file, start_idx=start_idx):
+            seq_len = min(len(seq), target_length)
+            if seq_len >= target_length:
+                if current_len:
+                    packs += 1
+                    current_len = 0
+                packs += 1
+                continue
+            if current_len and current_len + seq_len + 1 > target_length:
+                packs += 1
+                current_len = 0
+            if current_len:
+                current_len += 1
+            current_len += seq_len
+        if current_len:
+            packs += 1
+        return packs
+
+    def _mmap_cache_dir(self, sequences_file: str, start_idx: int,
+                         target_length: int, packed: bool) -> Path:
+        mmap_cfg = self.train_cfg.get('memory_mapped_dataset', {})
+        cache_root = mmap_cfg.get('cache_dir')
+        if cache_root:
+            base_dir = Path(cache_root)
+        else:
+            base_dir = Path(sequences_file).parent / "mmap_cache"
+        if self._staging_root and self.train_cfg.get('dataset_staging', {}).get('cache_on_staging', True):
+            base_dir = self._staging_root / "mmap_cache"
+        suffix = f"s{start_idx}_t{target_length}_p{int(packed)}"
+        return base_dir / suffix
+
+    def _ensure_mmap_dataset(
+        self,
+        sequences_file: str,
+        start_idx: int,
+        target_length: int,
+        pad_token_id: int,
+        eos_token_id: int,
+        packed: bool,
+        dtype: str,
+        vocab_limit: Optional[int] = None,
+    ) -> Tuple[MemmapTokenDataset, int]:
+        cache_dir = self._mmap_cache_dir(sequences_file, start_idx, target_length, packed)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        input_ids_path = cache_dir / "input_ids.mmap"
+        attention_mask_path = cache_dir / "attention_mask.mmap"
+        manifest_path = cache_dir / "manifest.json"
+
+        source_path = Path(sequences_file)
+        source_mtime = source_path.stat().st_mtime
+        source_size = source_path.stat().st_size
+        manifest = {}
+        if manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text())
+            except Exception:
+                manifest = {}
+
+        dtype_np = np.int64 if str(dtype).lower() == "int64" else np.int32
+        mask_dtype = np.uint8
+
+        checksum_cfg = self.train_cfg.get('memory_mapped_dataset', {})
+        checksum_enabled, checksum_mode, checksum_bytes = self._checksum_settings(checksum_cfg)
+        expected_checksum = manifest.get("source_checksum") if manifest else None
+
+        manifest_valid = (
+            manifest
+            and manifest.get("source_mtime") == source_mtime
+            and manifest.get("source_size") == source_size
+            and manifest.get("target_length") == target_length
+            and manifest.get("packed") == packed
+        )
+        if manifest_valid and checksum_enabled:
+            current_checksum = self._compute_file_checksum(
+                source_path, checksum_mode, checksum_bytes
+            )
+            if expected_checksum != current_checksum:
+                manifest_valid = False
+
+        if manifest_valid and input_ids_path.exists() and attention_mask_path.exists():
+            num_sequences = int(manifest.get("num_sequences", 0))
+            dataset = MemmapTokenDataset(
+                input_ids_path,
+                attention_mask_path,
+                (num_sequences, target_length),
+                dtype_np,
+                mask_dtype,
+            )
+            return dataset, num_sequences
+
+        if packed:
+            num_sequences = self._count_packed_sequences(
+                sequences_file, target_length, start_idx=start_idx
+            )
+            self._build_mmap_packed(
+                sequences_file,
+                input_ids_path,
+                attention_mask_path,
+                num_sequences,
+                target_length,
+                pad_token_id,
+                eos_token_id,
+                dtype_np,
+                mask_dtype,
+                start_idx=start_idx,
+                vocab_limit=vocab_limit,
+            )
+        else:
+            num_sequences, max_len = self._count_sequences(sequences_file, start_idx=start_idx)
+            self._build_mmap_unpacked(
+                sequences_file,
+                input_ids_path,
+                attention_mask_path,
+                num_sequences,
+                target_length,
+                pad_token_id,
+                dtype_np,
+                mask_dtype,
+                start_idx=start_idx,
+                vocab_limit=vocab_limit,
+            )
+
+        manifest = {
+            "source_path": sequences_file,
+            "source_mtime": source_mtime,
+            "source_size": source_size,
+            "target_length": target_length,
+            "num_sequences": num_sequences,
+            "packed": packed,
+            "dtype": str(dtype),
+            "checksum_mode": checksum_mode,
+            "checksum_bytes": checksum_bytes,
+        }
+        if checksum_enabled:
+            manifest["source_checksum"] = self._compute_file_checksum(
+                source_path, checksum_mode, checksum_bytes
+            )
+        manifest_path.write_text(json.dumps(manifest, indent=2))
+
+        dataset = MemmapTokenDataset(
+            input_ids_path,
+            attention_mask_path,
+            (num_sequences, target_length),
+            dtype_np,
+            mask_dtype,
+        )
+        return dataset, num_sequences
+
+    def _build_mmap_packed(
+        self,
+        sequences_file: str,
+        input_ids_path: Path,
+        attention_mask_path: Path,
+        num_sequences: int,
+        target_length: int,
+        pad_token_id: int,
+        eos_token_id: int,
+        dtype_np: np.dtype,
+        mask_dtype: np.dtype,
+        start_idx: int = 0,
+        vocab_limit: Optional[int] = None,
+    ) -> None:
+        input_ids = np.memmap(str(input_ids_path), dtype=dtype_np, mode='w+', shape=(num_sequences, target_length))
+        attention_mask = np.memmap(str(attention_mask_path), dtype=mask_dtype, mode='w+', shape=(num_sequences, target_length))
+
+        pack_idx = 0
+        current_tokens: List[int] = []
+        current_mask: List[int] = []
+
+        def finalize_pack():
+            nonlocal pack_idx, current_tokens, current_mask
+            if not current_tokens:
+                return
+            pad_len = target_length - len(current_tokens)
+            if pad_len > 0:
+                current_tokens.extend([pad_token_id] * pad_len)
+                current_mask.extend([0] * pad_len)
+            input_ids[pack_idx, :] = np.array(current_tokens[:target_length], dtype=dtype_np)
+            attention_mask[pack_idx, :] = np.array(current_mask[:target_length], dtype=mask_dtype)
+            pack_idx += 1
+            current_tokens = []
+            current_mask = []
+
+        for seq in self._iter_token_sequences(sequences_file, start_idx=start_idx):
+            if not seq:
+                continue
+            if vocab_limit is not None:
+                seq = [max(0, min(int(t), vocab_limit - 1)) for t in seq]
+            if len(seq) > target_length:
+                seq = seq[:target_length]
+            seq_len = len(seq)
+            if seq_len >= target_length:
+                finalize_pack()
+                input_ids[pack_idx, :] = np.array(seq[:target_length], dtype=dtype_np)
+                attention_mask[pack_idx, :] = 1
+                pack_idx += 1
+                continue
+            if current_tokens and len(current_tokens) + seq_len + 1 > target_length:
+                finalize_pack()
+            if current_tokens:
+                current_tokens.append(eos_token_id)
+                current_mask.append(1)
+            current_tokens.extend(seq)
+            current_mask.extend([1] * seq_len)
+
+        finalize_pack()
+        input_ids.flush()
+        attention_mask.flush()
+
+    def _build_mmap_unpacked(
+        self,
+        sequences_file: str,
+        input_ids_path: Path,
+        attention_mask_path: Path,
+        num_sequences: int,
+        target_length: int,
+        pad_token_id: int,
+        dtype_np: np.dtype,
+        mask_dtype: np.dtype,
+        start_idx: int = 0,
+        vocab_limit: Optional[int] = None,
+    ) -> None:
+        input_ids = np.memmap(str(input_ids_path), dtype=dtype_np, mode='w+', shape=(num_sequences, target_length))
+        attention_mask = np.memmap(str(attention_mask_path), dtype=mask_dtype, mode='w+', shape=(num_sequences, target_length))
+
+        row = 0
+        for seq in self._iter_token_sequences(sequences_file, start_idx=start_idx):
+            if not isinstance(seq, list):
+                continue
+            if vocab_limit is not None:
+                seq = [max(0, min(int(t), vocab_limit - 1)) for t in seq]
+            seq_len = min(len(seq), target_length)
+            if seq_len:
+                input_ids[row, :seq_len] = np.array(seq[:seq_len], dtype=dtype_np)
+                attention_mask[row, :seq_len] = 1
+            if seq_len < target_length:
+                input_ids[row, seq_len:] = pad_token_id
+                attention_mask[row, seq_len:] = 0
+            row += 1
+
+        input_ids.flush()
+        attention_mask.flush()
+
+    def _load_data_mmap(
+        self,
+        sequences_file: str,
+        start_idx: int = 0,
+        val_sequences_file: Optional[str] = None,
+        pack_target_override: Optional[int] = None,
+        stats: Optional[Dict[str, float]] = None,
+    ) -> Tuple[DataLoader, DataLoader, List[Dict], List[Dict], Optional[Dict[str, Any]]]:
+        mmap_cfg = self.train_cfg.get('memory_mapped_dataset', {})
+        dtype = mmap_cfg.get('dtype', 'int64')
+
+        # Ensure tokenizer loaded for vocab checks and pad/eos IDs
+        if self.tokenizer is None:
+            tok_name = self.model_cfg.get('tokenizer_name') or self.model_cfg.get('name')
+            trust_remote = bool(self.model_cfg.get('trust_remote_code', True))
+            self.tokenizer = AutoTokenizer.from_pretrained(tok_name, trust_remote_code=trust_remote)
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        pad_token_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+        eos_token_id = self.tokenizer.eos_token_id or pad_token_id
+        tokenizer_vocab_size = len(self.tokenizer)
+
+        data_vocab_size = self._peek_vocab_size(sequences_file)
+        if data_vocab_size is not None and data_vocab_size > tokenizer_vocab_size:
+            raise ValueError(
+                f"Token sequences in {sequences_file} were created with vocab_size={data_vocab_size}, "
+                f"but tokenizer {self.tokenizer.name_or_path} only has {tokenizer_vocab_size} tokens."
+            )
+
+        use_packing = self.train_cfg.get('use_sequence_packing', True)
+        pack_target = pack_target_override if pack_target_override is not None else mmap_cfg.get('pack_target')
+        if use_packing:
+            if pack_target is None or str(pack_target).lower() == "auto":
+                pack_target = self._auto_pack_target(stats, mmap_cfg)
+            pack_target = int(pack_target)
+            self.train_cfg['pack_target_selected'] = pack_target
+        else:
+            pack_target = 0
+
+        if use_packing:
+            target_length = pack_target
+            packed = True
+        else:
+            _, max_len = self._count_sequences(sequences_file, start_idx=start_idx)
+            actual_max_seq = ((max_len + 63) // 64) * 64 if max_len else 64
+            model_max = self.model_cfg.get('max_position_embeddings')
+            if model_max is None and getattr(self, 'model', None) is not None:
+                cfg = getattr(self.model, 'config', None)
+                model_max = getattr(cfg, 'max_position_embeddings', None) or getattr(cfg, 'n_positions', None)
+            if model_max is None:
+                model_max = int(self.train_cfg.get('context_window', 2048)) if isinstance(self.train_cfg, dict) else 2048
+            target_length = min(actual_max_seq, model_max)
+            packed = False
+
+        train_dataset, train_count = self._ensure_mmap_dataset(
+            sequences_file,
+            start_idx=start_idx,
+            target_length=target_length,
+            pad_token_id=pad_token_id,
+            eos_token_id=eos_token_id,
+            packed=packed,
+            dtype=dtype,
+            vocab_limit=tokenizer_vocab_size,
+        )
+
+        if train_count == 0:
+            raise ValueError(f"No token sequences found in {sequences_file}")
+
+        train_metadata = [{} for _ in range(train_count)]
+
+        if val_sequences_file:
+            val_dataset, val_count = self._ensure_mmap_dataset(
+                val_sequences_file,
+                start_idx=0,
+                target_length=target_length,
+                pad_token_id=pad_token_id,
+                eos_token_id=eos_token_id,
+                packed=packed,
+                dtype=dtype,
+                vocab_limit=tokenizer_vocab_size,
+            )
+            val_metadata = [{} for _ in range(val_count)]
+        else:
+            val_ratio = float(self.train_cfg.get('validation_split', 0.1))
+            val_count = max(1, int(train_count * val_ratio)) if train_count > 1 else 0
+            train_count = train_count - val_count
+            indices = list(range(train_count + val_count))
+            train_indices = indices[:train_count]
+            val_indices = indices[train_count:]
+            base_dataset = train_dataset
+            train_dataset = Subset(base_dataset, train_indices)
+            val_dataset = Subset(base_dataset, val_indices) if val_indices else Subset(base_dataset, [])
+            train_metadata = [{} for _ in range(len(train_indices))]
+            val_metadata = [{} for _ in range(len(val_indices))]
+
+        train_sampler, curriculum_summary = self._build_curriculum_sampler(train_metadata)
+
+        batch_size = self._get_batch_size(seq_length=target_length)
+        num_workers = self._recommend_num_workers()
+        use_pin_memory = self.train_cfg.get('pin_memory', True) and torch.cuda.is_available()
+        pin_memory_device = self.train_cfg.get('pin_memory_device')
+        prefetch_factor = int(self.train_cfg.get('prefetch_factor', 4))
+        if num_workers == 0:
+            prefetch_factor = None
+
+        loader_kwargs = {
+            'batch_size': batch_size,
+            'num_workers': num_workers,
+            'pin_memory': use_pin_memory,
+            'prefetch_factor': prefetch_factor,
+            'persistent_workers': num_workers > 0,
+        }
+        if pin_memory_device and 'pin_memory_device' in inspect.signature(DataLoader).parameters:
+            loader_kwargs['pin_memory_device'] = pin_memory_device
+
+        train_loader = DataLoader(
+            train_dataset,
+            sampler=train_sampler,
+            shuffle=train_sampler is None,
+            **loader_kwargs,
+        )
+
+        val_loader = DataLoader(
+            val_dataset,
+            shuffle=False,
+            **loader_kwargs,
+        )
+
+        logger.info(
+            f"🗺️ Memory-mapped dataset loaded: {len(train_dataset)} train, {len(val_dataset)} val, "
+            f"seq_len={target_length}, packed={packed}"
+        )
+
+        return train_loader, val_loader, train_metadata, val_metadata, curriculum_summary
+
     def _safe_scaled_step(self, scaler, optimizer):
         """Work around PyTorch bug where inf checks may be missing"""
         try:
@@ -1003,6 +2286,40 @@ class OptimizedModelTrainer:
         """Load model and tokenizer with quantization and LoRA if configured"""
         logger.info(f"Loading model and tokenizer...")
 
+        # CRITICAL: Clean CUDA memory before model loading to maximize available VRAM
+        if torch.cuda.is_available():
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            free_mem, total_mem = torch.cuda.mem_get_info()
+            free_gb = free_mem / (1024**3)
+            logger.info(f"Pre-model-load VRAM: {free_gb:.2f} GB / {total_mem/(1024**3):.2f} GB free")
+
+        # Check if we're using DeepSpeed with CPU offload
+        # If so, we should load model on CPU to let DeepSpeed handle GPU placement
+        use_deepspeed_offload = False
+        deepspeed_config_path = None
+        import sys
+        for i, arg in enumerate(sys.argv):
+            if arg == '--deepspeed' and i + 1 < len(sys.argv):
+                deepspeed_config_path = sys.argv[i + 1]
+                break
+
+        if deepspeed_config_path and os.path.exists(deepspeed_config_path):
+            try:
+                import json
+                with open(deepspeed_config_path, 'r') as f:
+                    ds_config = json.load(f)
+                zero_config = ds_config.get('zero_optimization', {})
+                if zero_config.get('stage') == 3:
+                    offload_params = zero_config.get('offload_param', {})
+                    if offload_params.get('device') == 'cpu':
+                        use_deepspeed_offload = True
+                        logger.info("🔧 DeepSpeed ZeRO-3 with CPU offload detected - loading model on CPU")
+            except Exception as e:
+                logger.warning(f"Could not parse DeepSpeed config: {e}")
+
         # Synthetic mode: no downloads; used by tests/CI.
         if self.model_cfg.get("synthetic_model", False):
             self._init_synthetic_model_and_tokenizer()
@@ -1060,18 +2377,34 @@ class OptimizedModelTrainer:
             attn_implementation = "flash_attention_2" if HAS_FLASH_ATTN else "sdpa"
             logger.info(f"Using attention implementation: {attn_implementation}")
 
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_cfg['name'],
-                quantization_config=quantization_config,
-                device_map='auto' if (self.model_cfg['use_4bit'] or self.model_cfg['use_8bit']) else None,
-                trust_remote_code=self.model_cfg['trust_remote_code'],
-                torch_dtype=torch.bfloat16 if self.model_cfg['use_bf16'] else torch.float32,
-                attn_implementation=attn_implementation,  # FlashAttention-2 or SDPA
-                use_cache=False,  # Required for training with Flash Attention
-            )
+            # CRITICAL MEMORY FIX: When using DeepSpeed ZeRO-3 with CPU offload, load on CPU
+            # and let DeepSpeed handle GPU placement to avoid OOM
+            if use_deepspeed_offload:
+                # Load model on CPU without device_map
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_cfg['name'],
+                    quantization_config=None,  # Disable quantization with ZeRO-3
+                    device_map=None,  # Don't use device_map with DeepSpeed
+                    trust_remote_code=self.model_cfg['trust_remote_code'],
+                    torch_dtype=torch.float16,  # FP16 for DeepSpeed
+                    attn_implementation=attn_implementation,
+                    use_cache=False,
+                    low_cpu_mem_usage=True,  # Use less CPU memory during loading
+                )
+                logger.info("✓ Model loaded on CPU for DeepSpeed ZeRO-3 offloading")
+            else:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_cfg['name'],
+                    quantization_config=quantization_config,
+                    device_map='auto' if (self.model_cfg['use_4bit'] or self.model_cfg['use_8bit']) else None,
+                    trust_remote_code=self.model_cfg['trust_remote_code'],
+                    torch_dtype=torch.bfloat16 if self.model_cfg['use_bf16'] else torch.float32,
+                    attn_implementation=attn_implementation,  # FlashAttention-2 or SDPA
+                    use_cache=False,  # Required for training with Flash Attention
+                )
 
-        # If not using quantized device_map, move model explicitly to selected device
-        if not (self.model_cfg['use_4bit'] or self.model_cfg['use_8bit']):
+        # If not using quantized device_map or DeepSpeed offload, move model explicitly to selected device
+        if not (self.model_cfg['use_4bit'] or self.model_cfg['use_8bit'] or use_deepspeed_offload):
             self.model = self.model.to(self.device)
         else:
             # For 8-bit quantized models, we need to ensure any buffers are on the correct device
@@ -1152,17 +2485,22 @@ class OptimizedModelTrainer:
     def _apply_lora(self):
         """Apply LoRA (Parameter-Efficient Fine-Tuning) to the model"""
         lora_cfg = self.model_cfg['lora']
-        
-        peft_config = LoraConfig(
-            r=lora_cfg['r'],
-            lora_alpha=lora_cfg['lora_alpha'],
-            target_modules=lora_cfg['target_modules'],
-            lora_dropout=lora_cfg['lora_dropout'],
-            bias=lora_cfg['bias'],
-            task_type=TaskType.CAUSAL_LM,
-        )
-        
-        model = get_peft_model(self.model, peft_config)
+        if self.model_cfg.get("cpu_offload_lora", False) and not HAS_CPU_LORA_OFFLOAD:
+            logger.warning(f"cpu_offload_lora requested but unavailable: {_cpu_offload_import_error}")
+        use_cpu_offload = bool(self.model_cfg.get("cpu_offload_lora", False)) and HAS_CPU_LORA_OFFLOAD
+
+        if use_cpu_offload:
+            model = apply_cpu_offloaded_lora(self.model, lora_cfg)
+        else:
+            peft_config = LoraConfig(
+                r=lora_cfg['r'],
+                lora_alpha=lora_cfg['lora_alpha'],
+                target_modules=lora_cfg['target_modules'],
+                lora_dropout=lora_cfg['lora_dropout'],
+                bias=lora_cfg['bias'],
+                task_type=TaskType.CAUSAL_LM,
+            )
+            model = get_peft_model(self.model, peft_config)
         
         # Log trainable params
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1175,6 +2513,8 @@ class OptimizedModelTrainer:
         logger.info(f"  Target modules: {lora_cfg['target_modules']}")
         logger.info(f"  Trainable params: {trainable_params:,} ({trainable_percent:.3f}%)")
         logger.info(f"  Total params: {total_params:,}\n")
+        if use_cpu_offload:
+            logger.info("  Mode: CPU-pinned LoRA adapters (staged to GPU per step)")
         
         return model
 
@@ -1330,6 +2670,117 @@ class OptimizedModelTrainer:
         """Load and prepare data"""
         logger.info(f"Loading sequences from {sequences_file}...")
 
+        sequences_file = self._stage_dataset_if_needed(sequences_file)
+        if val_sequences_file:
+            val_sequences_file = self._stage_dataset_if_needed(val_sequences_file)
+
+        mmap_cfg = self.train_cfg.get('memory_mapped_dataset', {})
+        probe_cfg = self.train_cfg.get('throughput_probe', {})
+        use_packing = self.train_cfg.get('use_sequence_packing', True)
+        is_pretokenized = self._is_pretokenized_jsonl(sequences_file)
+        stats = None
+
+        if is_pretokenized and (use_packing or (isinstance(mmap_cfg, dict) and mmap_cfg.get('enabled', False))):
+            stats = self._profile_sequence_lengths(sequences_file, start_idx=start_idx)
+            self.dataset_stats = stats
+            logger.info(
+                f"Dataset stats: count={stats['count']:,}, avg={stats['avg']:.0f}, "
+                f"p95={stats['p95']:.0f}, max={stats['max']:.0f}"
+            )
+
+        pack_target = None
+        if use_packing and stats is not None:
+            pack_target = mmap_cfg.get('pack_target') if isinstance(mmap_cfg, dict) else None
+            pack_target_locked = False
+            if pack_target is None or str(pack_target).lower() == "auto":
+                pack_target = self._auto_pack_target(stats, mmap_cfg if isinstance(mmap_cfg, dict) else None)
+            else:
+                pack_target = int(pack_target)
+                pack_target_locked = True
+
+            candidates = [pack_target]
+            if isinstance(mmap_cfg, dict):
+                min_target = int(mmap_cfg.get('pack_target_min', 256))
+                max_target = int(mmap_cfg.get('pack_target_max', 4096))
+                base_target = self._auto_pack_target(None, mmap_cfg)
+                p95_target = self._next_pow2(int(stats.get('p95', pack_target)))
+                for candidate in (base_target, p95_target, pack_target):
+                    candidate = max(min_target, min(max_target, candidate))
+                    candidates.append(candidate)
+                candidates = sorted(set(candidates))
+                if bool(probe_cfg.get('favor_speed', True)):
+                    candidates = sorted(candidates)
+                else:
+                    candidates = sorted(candidates, reverse=True)
+                max_candidates = int(probe_cfg.get('max_candidates', 3)) if isinstance(probe_cfg, dict) else 3
+                if len(candidates) > max_candidates:
+                    candidates = candidates[:max_candidates]
+
+            joint_choice = None
+            user_batch_override = None
+            if isinstance(self.train_cfg, dict):
+                user_batch_override = self.train_cfg.get('batch_size_override')
+
+            if not pack_target_locked and isinstance(probe_cfg, dict) and probe_cfg.get('joint_batch_pack', False):
+                if not user_batch_override:
+                    batch_candidates = self._batch_size_candidates_for_probe(
+                        seq_len=pack_target,
+                        probe_cfg=probe_cfg,
+                    )
+                    joint_choice = self._select_pack_target_and_batch_from_probe(
+                        seq_candidates=candidates,
+                        batch_candidates=batch_candidates,
+                        probe_cfg=probe_cfg,
+                    )
+                    if joint_choice:
+                        pack_target, batch_choice = joint_choice
+                        self.train_cfg['batch_size_selected'] = int(batch_choice)
+                        self.train_cfg['batch_size_override'] = int(batch_choice)
+                        logger.info(
+                            f"Throughput probe selected pack_target={pack_target}, "
+                            f"batch_size={batch_choice}"
+                        )
+                else:
+                    logger.info("Batch size override provided; skipping joint batch/pack probe")
+
+            if joint_choice is None and not pack_target_locked:
+                probe_choice = self._select_pack_target_from_probe(
+                    candidates=candidates,
+                    batch_size=max(1, int(self.train_cfg.get('batch_size_reference', 2))),
+                    probe_cfg=probe_cfg if isinstance(probe_cfg, dict) else {},
+                )
+                if probe_choice:
+                    pack_target = probe_choice
+            logger.info(f"Selected pack_target={pack_target} tokens")
+            self.train_cfg['pack_target_selected'] = pack_target
+
+        if isinstance(mmap_cfg, dict) and mmap_cfg.get('enabled', False) and is_pretokenized:
+            val_ok = True if not val_sequences_file else self._is_pretokenized_jsonl(val_sequences_file)
+            if val_ok:
+                packed_count = None
+                if use_packing and pack_target:
+                    packed_count = self._count_packed_sequences(
+                        sequences_file, int(pack_target), start_idx=start_idx
+                    )
+                seq_len_est = int(pack_target) if (use_packing and pack_target) else int(stats.get('max', 0)) if stats else 0
+                use_memmap = self._should_use_memmap(
+                    mmap_cfg,
+                    stats if stats else {'count': 0},
+                    seq_len_est,
+                    packed_count=packed_count,
+                )
+                if use_memmap:
+                    return self._load_data_mmap(
+                        sequences_file,
+                        start_idx=start_idx,
+                        val_sequences_file=val_sequences_file,
+                        pack_target_override=pack_target,
+                        stats=stats,
+                    )
+                logger.info("Dataset fits in RAM; using in-memory TensorDataset instead of memmap.")
+            else:
+                logger.warning("Memory-mapped dataset requested but input is not pre-tokenized; falling back to RAM load.")
+
         sequences = []
         data_vocab_size = None
         metadata_map = {}
@@ -1469,20 +2920,26 @@ class OptimizedModelTrainer:
                 avg_seq = sum(seq_lengths) / len(seq_lengths)
                 logger.info(f"📊 Data: {len(seq_lengths)} seqs, max={max_seq}, avg={avg_seq:.0f} tokens")
 
-                # 🔥 SPEED-FIRST: Use TINY pack target for Turing!
-                if gpu_compute_cap >= 8.0:  # Ampere+ with FlashAttention - can handle long
-                    pack_target = 2048
-                    logger.info("🚀 Ampere+: 2K pack (FlashAttention)")
-                elif gpu_compute_cap >= 7.5:  # Turing - SPEED IS EVERYTHING!
-                    pack_target = 256  # BLAZING FAST! 50+ it/s possible!
-                    truncated = sum(1 for l in seq_lengths if l > 256)
-                    logger.info(f"⚡⚡⚡ TURING ULTRA-SPEED MODE ⚡⚡⚡")
-                    logger.info(f"📦 Pack target: 256 tokens (50+ it/s expected!)")
-                    logger.info(f"⚠️ {truncated}/{len(seq_lengths)} sequences will be chunked/truncated")
-                    logger.info(f"   This is OK! Speed >> preserving every token")
+                if pack_target is None:
+                    # 🔥 SPEED-FIRST: Use TINY pack target for Turing!
+                    if gpu_compute_cap >= 8.0:  # Ampere+ with FlashAttention - can handle long
+                        pack_target = 2048
+                        logger.info("🚀 Ampere+: 2K pack (FlashAttention)")
+                    elif gpu_compute_cap >= 7.5:  # Turing - SPEED IS EVERYTHING!
+                        pack_target = 256  # BLAZING FAST! 50+ it/s possible!
+                        truncated = sum(1 for l in seq_lengths if l > 256)
+                        logger.info(f"⚡⚡⚡ TURING ULTRA-SPEED MODE ⚡⚡⚡")
+                        logger.info(f"📦 Pack target: 256 tokens (50+ it/s expected!)")
+                        logger.info(f"⚠️ {truncated}/{len(seq_lengths)} sequences will be chunked/truncated")
+                        logger.info(f"   This is OK! Speed >> preserving every token")
+                    else:
+                        pack_target = 256
+                        logger.info("📦 256 pack for older GPU")
                 else:
-                    pack_target = 256
-                    logger.info("📦 256 pack for older GPU")
+                    truncated = sum(1 for l in seq_lengths if l > pack_target)
+                    logger.info(f"📦 Pack target: {pack_target} tokens (empirically selected)")
+                    if truncated:
+                        logger.info(f"⚠️ {truncated}/{len(seq_lengths)} sequences will be truncated")
                 eos_token_id = self.tokenizer.eos_token_id or pad_token_id
 
                 # Clean and validate sequences first
@@ -1535,6 +2992,25 @@ class OptimizedModelTrainer:
             input_ids = encodings['input_ids']
             attention_mask = encodings['attention_mask']
 
+        def _maybe_pin(name: str, tensor: torch.Tensor) -> torch.Tensor:
+            """Pin tensor to RAM if headroom allows; speeds up H2D copies."""
+            if not self.train_cfg.get('use_ram_cache', True):
+                return tensor
+            try:
+                # Use available RAM rather than total to be conservative
+                available_ram = psutil.virtual_memory().available
+                ratio_limit = float(self.train_cfg.get('ram_cache_max_ratio', 0.5))
+                if tensor.nbytes <= available_ram * ratio_limit:
+                    pinned = tensor.pin_memory()
+                    logger.info(f"RAM cache: pinned {name} ({tensor.nbytes/1e9:.2f} GB)")
+                    return pinned
+                else:
+                    budget_gb = available_ram * ratio_limit / 1e9
+                    logger.info(f"RAM cache skipped for {name}: needs {tensor.nbytes/1e9:.2f} GB, budget {budget_gb:.2f} GB")
+            except Exception as e:
+                logger.warning(f"RAM cache pin failed for {name}: {e}")
+            return tensor
+
         # Build metadata aligned with the sequences we loaded
         if metadata_map:
             sequence_metadata = []
@@ -1584,6 +3060,8 @@ class OptimizedModelTrainer:
                     valid_seq = [max(0, min(int(t), tokenizer_vocab_size - 1)) for t in seq[:seq_len]]
                     val_input_ids[idx, :seq_len] = torch.tensor(valid_seq, dtype=torch.long)
                     val_attention_mask[idx, :seq_len] = 1
+            val_input_ids = _maybe_pin("val input_ids", val_input_ids)
+            val_attention_mask = _maybe_pin("val attention_mask", val_attention_mask)
 
             train_dataset = dataset
             val_dataset = TensorDataset(val_input_ids, val_attention_mask)
@@ -1611,37 +3089,46 @@ class OptimizedModelTrainer:
 
         # 🔥 MEGA BATCH: Determine batch size based on GPU memory AND sequence length!
         batch_size = self._get_batch_size(seq_length=max_length)
-        
+
+        input_ids = _maybe_pin("train input_ids", input_ids)
+        attention_mask = _maybe_pin("train attention_mask", attention_mask)
+
         # 1% OPTIMIZATION: Optimized DataLoader settings
         # - num_workers: Parallel data loading (4 is sweet spot for most systems)
         # - pin_memory: Fast GPU transfer via page-locked memory
         # - prefetch_factor: Load ahead while GPU computes (2-4 optimal)
         # - persistent_workers: Keep workers alive between epochs (saves startup time)
-        num_workers = max(4, self.train_cfg.get('num_workers', 0))
+        num_workers = self._recommend_num_workers()
         use_pin_memory = self.train_cfg.get('pin_memory', True) and torch.cuda.is_available()
+        pin_memory_device = self.train_cfg.get('pin_memory_device')
+        prefetch_factor = int(self.train_cfg.get('prefetch_factor', 4))
+        if num_workers == 0:
+            prefetch_factor = None
+
+        loader_kwargs = {
+            'batch_size': batch_size,
+            'num_workers': num_workers,
+            'pin_memory': use_pin_memory,
+            'prefetch_factor': prefetch_factor,
+            'persistent_workers': num_workers > 0,
+        }
+        if pin_memory_device and 'pin_memory_device' in inspect.signature(DataLoader).parameters:
+            loader_kwargs['pin_memory_device'] = pin_memory_device
 
         train_loader = DataLoader(
             train_dataset,
-            batch_size=batch_size,
             sampler=train_sampler,
             shuffle=train_sampler is None,
-            num_workers=num_workers,
-            pin_memory=use_pin_memory,
-            prefetch_factor=2 if num_workers > 0 else None,
-            persistent_workers=num_workers > 0,
+            **loader_kwargs,
         )
 
         val_loader = DataLoader(
             val_dataset,
-            batch_size=batch_size,
             shuffle=False,
-            num_workers=num_workers,
-            pin_memory=use_pin_memory,
-            prefetch_factor=2 if num_workers > 0 else None,
-            persistent_workers=num_workers > 0,
+            **loader_kwargs,
         )
 
-        logger.info(f"🚀 DataLoader optimized: {num_workers} workers, pin_memory={use_pin_memory}, prefetch=2")
+        logger.info(f"🚀 DataLoader optimized: {num_workers} workers, pin_memory={use_pin_memory}, prefetch={prefetch_factor}")
         
         logger.info(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
         logger.info(f"Batch size: {batch_size}")
@@ -1666,6 +3153,19 @@ class OptimizedModelTrainer:
             )
         
         return train_loader, val_loader, train_metadata, val_metadata, curriculum_summary
+
+    def _recommend_num_workers(self) -> int:
+        """Use available CPU cores to maximize input pipeline throughput."""
+        explicit = self.train_cfg.get('num_workers', None)
+        if explicit and explicit > 0:
+            return int(explicit)
+
+        # Auto-tune based on CPU cores
+        cpu_total = psutil.cpu_count(logical=True) or 4
+        target = max(2, cpu_total - 1)  # leave 1 core for main thread/OS
+        upper = self.train_cfg.get('num_workers_max', cpu_total)
+        lower = self.train_cfg.get('num_workers_min', 0)
+        return max(lower, min(target, upper))
     
     def _build_curriculum_sampler(
         self,
@@ -1838,7 +3338,7 @@ class OptimizedModelTrainer:
             }
         return summary
     
-    def _get_batch_size(self, seq_length: int = 2048) -> int:
+    def _get_batch_size(self, seq_length: int = 2048, *, log: bool = True) -> int:
         """
         🧠🧠🧠 EINSTEIN-LEVEL MEMORY CALCULATION 🧠🧠🧠
 
@@ -1864,6 +3364,12 @@ class OptimizedModelTrainer:
 
         FORMULA: max_batch = (available_memory - model_overhead) / activation_per_item
         """
+        override = None
+        if isinstance(self.train_cfg, dict):
+            override = self.train_cfg.get('batch_size_override') or self.train_cfg.get('batch_size_selected')
+        if override:
+            return max(1, int(override))
+
         if not torch.cuda.is_available():
             return self.train_cfg['batch_size_small']
 
@@ -1917,11 +3423,12 @@ class OptimizedModelTrainer:
         # Clamp to reasonable range
         max_batch = max(1, min(max_batch, 16))
 
-        logger.info(f"🧠 EINSTEIN MEMORY CALC:")
-        logger.info(f"   Total VRAM: {total_gb:.2f}GB, Free: {free_gb:.2f}GB")
-        logger.info(f"   Checkpointing: {'YES (3x memory saving)' if uses_checkpointing else 'NO'}")
-        logger.info(f"   Activation/item: {activation_per_item_mb:.0f}MB (seq={seq_length})")
-        logger.info(f"   Available: {available_for_batches_mb:.0f}MB → Batch: {max_batch}")
+        if log:
+            logger.info(f"🧠 EINSTEIN MEMORY CALC:")
+            logger.info(f"   Total VRAM: {total_gb:.2f}GB, Free: {free_gb:.2f}GB")
+            logger.info(f"   Checkpointing: {'YES (3x memory saving)' if uses_checkpointing else 'NO'}")
+            logger.info(f"   Activation/item: {activation_per_item_mb:.0f}MB (seq={seq_length})")
+            logger.info(f"   Available: {available_for_batches_mb:.0f}MB → Batch: {max_batch}")
 
         return max_batch
     
@@ -1973,10 +3480,19 @@ class OptimizedModelTrainer:
         # Setup optimizer and scheduler
         # TIER 4 OPTIMIZATION: Use 8-bit AdamW optimizer to save ~1.7 GB VRAM
         # 1% OPTIMIZATION: Use fused=True for 1.2x faster optimizer step
+        params_for_base = list(self.model.parameters())
+        if self.model_cfg.get("cpu_offload_lora", False):
+            if HAS_CPU_LORA_OFFLOAD:
+                normal_params, _ = get_cpu_offload_parameters(self.model)
+                params_for_base = [p for p in normal_params if p.requires_grad]
+                logger.info(f"Using CPU-offloaded LoRA: {len(params_for_base)} parameters stay on GPU optimizer")
+            else:
+                warnings.warn("cpu_offload_lora requested but offload module unavailable; falling back to standard LoRA")
+
         if HAS_BNB_OPTIMIZER:
             logger.info("🚀 Using bitsandbytes 8-bit AdamW optimizer (saves ~1.7 GB VRAM!)")
             optimizer = bnb.optim.AdamW8bit(
-                self.model.parameters(),
+                params_for_base,
                 lr=self.train_cfg['base_learning_rate'],
                 betas=(0.9, 0.999),
                 eps=1e-8,
@@ -1986,7 +3502,7 @@ class OptimizedModelTrainer:
             # Try to use fused AdamW (1.2x faster) if available
             try:
                 optimizer = AdamW(
-                    self.model.parameters(),
+                    params_for_base,
                     lr=self.train_cfg['base_learning_rate'],
                     weight_decay=self.train_cfg['weight_decay'],
                     fused=True,  # 1% OPTIMIZATION: Fused kernel for optimizer (1.2x speedup)
@@ -1995,12 +3511,96 @@ class OptimizedModelTrainer:
             except TypeError:
                 # Fallback for older PyTorch versions
                 optimizer = AdamW(
-                    self.model.parameters(),
+                    params_for_base,
                     lr=self.train_cfg['base_learning_rate'],
                     weight_decay=self.train_cfg['weight_decay'],
                 )
                 logger.info("Using standard AdamW optimizer")
-        
+
+        if self.model_cfg.get("cpu_offload_lora", False) and HAS_CPU_LORA_OFFLOAD:
+            optimizer = wrap_optimizer_for_cpu_offload(
+                optimizer,
+                self.model,
+                lr=self.train_cfg['base_learning_rate'],
+                betas=(0.9, 0.999),
+                eps=1e-8,
+                weight_decay=self.train_cfg['weight_decay'],
+                device=self.device,
+                use_fp16_updates=True,
+            )
+            logger.info("Optimizer wrapped for CPU LoRA offload (staging adapters to GPU during step)")
+
+        lookahead_cfg = self.train_cfg.get('lookahead', {}) if isinstance(self.train_cfg, dict) else {}
+        if isinstance(lookahead_cfg, dict) and lookahead_cfg.get('enabled', False):
+            k = int(lookahead_cfg.get('k', 5))
+            alpha = float(lookahead_cfg.get('alpha', 0.5))
+            optimizer = LookaheadOptimizer(optimizer, k=k, alpha=alpha)
+            logger.info(f"👀 Lookahead enabled (k={k}, alpha={alpha})")
+
+        # 🚀🚀🚀 1% of 1% OPTIMIZATION: DeepSpeed ZeRO-3 with FULL CPU OFFLOAD 🚀🚀🚀
+        # This is the KEY to fitting large contexts on 8GB GPU - offload EVERYTHING to CPU/RAM!
+        self.use_deepspeed = False
+        self.deepspeed_engine = None
+        deepspeed_config_path = None
+
+        import sys as _sys
+        for i, arg in enumerate(_sys.argv):
+            if arg == '--deepspeed' and i + 1 < len(_sys.argv):
+                deepspeed_config_path = _sys.argv[i + 1]
+                break
+
+        if deepspeed_config_path and os.path.exists(deepspeed_config_path):
+            try:
+                import deepspeed
+                import json
+
+                logger.info("🔥🔥🔥 DEEPSPEED ZeRO-3 ACTIVATION 🔥🔥🔥")
+                logger.info("Offloading model parameters, optimizer states, AND gradients to CPU!")
+
+                # Load DeepSpeed config
+                with open(deepspeed_config_path, 'r') as f:
+                    ds_config = json.load(f)
+
+                # Set batch sizes if 'auto'
+                if ds_config.get('train_batch_size') == 'auto':
+                    ds_config['train_batch_size'] = 1 * self.train_cfg['gradient_accumulation_steps']
+                if ds_config.get('gradient_accumulation_steps') == 'auto':
+                    ds_config['gradient_accumulation_steps'] = self.train_cfg['gradient_accumulation_steps']
+
+                # Initialize DeepSpeed engine - this wraps model, optimizer, and handles offloading
+                self.deepspeed_engine, optimizer, _, _ = deepspeed.initialize(
+                    model=self.model,
+                    optimizer=optimizer,
+                    config=ds_config,
+                    dist_init_required=True,
+                )
+
+                # Replace model reference with DeepSpeed engine
+                self.model = self.deepspeed_engine.module
+                self.use_deepspeed = True
+
+                # Log memory savings
+                zero_stage = ds_config.get('zero_optimization', {}).get('stage', 0)
+                offload_optimizer = ds_config.get('zero_optimization', {}).get('offload_optimizer', {}).get('device', 'none')
+                offload_param = ds_config.get('zero_optimization', {}).get('offload_param', {}).get('device', 'none')
+
+                logger.info(f"✅ DeepSpeed ZeRO-{zero_stage} initialized!")
+                logger.info(f"   Optimizer offload: {offload_optimizer}")
+                logger.info(f"   Parameter offload: {offload_param}")
+                logger.info(f"   Activation checkpointing: CPU")
+                logger.info("🧠 GPU will only hold ACTIVE tensors - everything else in RAM!")
+
+                # Check RAM usage
+                import psutil
+                ram = psutil.virtual_memory()
+                logger.info(f"   RAM available: {ram.available / 1e9:.1f} GB / {ram.total / 1e9:.1f} GB")
+
+            except ImportError:
+                logger.warning("DeepSpeed not installed - falling back to standard training")
+            except Exception as e:
+                logger.error(f"DeepSpeed initialization failed: {e}")
+                logger.warning("Falling back to standard training (may OOM)")
+
         grad_accum_steps = self.train_cfg['gradient_accumulation_steps']
         steps_per_epoch = math.ceil(len(train_loader) / grad_accum_steps)
         total_steps = steps_per_epoch * num_epochs
@@ -2022,6 +3622,38 @@ class OptimizedModelTrainer:
             patience=max(1, self.train_cfg.get('lr_plateau_patience', 2)),
             threshold=self.train_cfg['min_delta'],
         )
+
+        swa_cfg = self.train_cfg.get('swa', {}) if isinstance(self.train_cfg, dict) else {}
+        swa_enabled = bool(swa_cfg.get('enabled', False)) and HAS_SWA_UTILS
+        swa_model = None
+        swa_scheduler = None
+        swa_start_step = total_steps + 1
+        swa_updates = 0
+        if swa_enabled:
+            swa_start_epoch = int(swa_cfg.get('start_epoch', max(0, num_epochs - 1)))
+            if swa_start_epoch < 0:
+                swa_start_epoch = 0
+            if swa_start_epoch >= num_epochs:
+                swa_start_epoch = max(0, num_epochs - 1)
+            swa_start_step = swa_start_epoch * steps_per_epoch
+            swa_lr = swa_cfg.get('swa_lr')
+            if swa_lr is None:
+                swa_lr = float(self.train_cfg['base_learning_rate']) * 0.1
+            anneal_strategy = str(swa_cfg.get('anneal_strategy', 'cos'))
+            anneal_epochs = int(swa_cfg.get('anneal_epochs', 5))
+            swa_model = AveragedModel(self.model)
+            swa_scheduler = SWALR(
+                optimizer,
+                swa_lr=float(swa_lr),
+                anneal_strategy=anneal_strategy,
+                anneal_epochs=anneal_epochs,
+            )
+            logger.info(
+                f"📊 SWA enabled (start_epoch={swa_start_epoch}, swa_lr={float(swa_lr):.2e}, "
+                f"anneal={anneal_strategy}/{anneal_epochs})"
+            )
+        elif bool(swa_cfg.get('enabled', False)) and not HAS_SWA_UTILS:
+            logger.warning("SWA requested but unavailable; disabling SWA")
         
         logger.info(f"\nTraining Setup:")
         logger.info(f"  Total steps: {total_steps}")
@@ -2045,6 +3677,18 @@ class OptimizedModelTrainer:
         else:
             scaler = None
         use_scaler = scaler is not None and scaler.is_enabled()
+
+        graph_cfg = self.train_cfg.get('cuda_graphs', {}) if isinstance(self.train_cfg, dict) else {}
+        use_cuda_graphs = bool(graph_cfg.get('enabled', False)) and torch.cuda.is_available()
+        if use_cuda_graphs and (use_scaler or self.train_cfg['gradient_accumulation_steps'] != 1):
+            logger.info("CUDA graphs disabled (requires grad_accum=1 and no GradScaler)")
+            use_cuda_graphs = False
+        if use_cuda_graphs and self.train_cfg.get('curriculum', {}).get('enabled', False):
+            logger.info("CUDA graphs disabled (curriculum changes sequence length)")
+            use_cuda_graphs = False
+
+        label_cfg = self.train_cfg.get('label_smoothing', {}) if isinstance(self.train_cfg, dict) else {}
+        label_smoothing = float(label_cfg.get('smoothing', 0.0)) if label_cfg.get('enabled', False) else 0.0
         
         # --- CRITICAL FIX START ---
         # Fix "element 0 of tensors does not require grad" for 4-bit + LoRA
@@ -2110,6 +3754,8 @@ class OptimizedModelTrainer:
             logger.info(f"⚡ ESTIMATED EPOCH TIME: ~{epoch_time_est:.1f} minutes")
         logger.info("=" * 60 + "\n")
 
+        graph_ctx = None
+
         for epoch in range(num_epochs):
             epoch_start = time.time()
 
@@ -2125,7 +3771,8 @@ class OptimizedModelTrainer:
             epoch_grad_norms = []
 
             # 1% OPTIMIZATION: set_to_none=True is faster than zeroing gradients
-            optimizer.zero_grad(set_to_none=True)
+            if not (self.use_deepspeed and self.deepspeed_engine is not None):
+                optimizer.zero_grad(set_to_none=True)
 
             # 🔥🔥🔥 CUDA STREAM PREFETCHING: Overlap data transfer with compute!
             prefetcher = CUDADataPrefetcher(train_loader, self.device)
@@ -2142,7 +3789,7 @@ class OptimizedModelTrainer:
                 # Optimization: if attention_mask is effectively "all tokens valid", pass None.
                 # This avoids needless work in attention and can unlock Orchard FlashAttention on MPS.
                 attn_mask_to_use = attention_mask
-                if self.train_cfg.get('drop_full_attention_mask', True):
+                if not use_cuda_graphs and self.train_cfg.get('drop_full_attention_mask', True):
                     try:
                         if attn_mask_to_use is not None:
                             if attn_mask_to_use.dtype == torch.bool:
@@ -2176,54 +3823,115 @@ class OptimizedModelTrainer:
                 if attention_mask is not None:
                     labels = labels.masked_fill(attention_mask == 0, -100)
 
-                # Forward pass
-                with torch.amp.autocast(device_type=self.amp_device, enabled=use_autocast):
-                    outputs = self.model(
-                        input_ids=input_ids,
-                        attention_mask=attn_mask_to_use,
-                        labels=labels,
-                    )
-                    loss = outputs.loss / self.train_cfg['gradient_accumulation_steps']
+                # Forward + backward pass (optionally via CUDA graphs)
+                loss = None
+                if use_cuda_graphs:
+                    if graph_ctx is None:
+                        graph_ctx = self._setup_cuda_graph(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            labels=labels,
+                            use_autocast=use_autocast,
+                            warmup_steps=int(graph_cfg.get('warmup_steps', 2)),
+                            label_smoothing=label_smoothing,
+                        )
+                    if graph_ctx and graph_ctx['static_input_ids'].shape == input_ids.shape:
+                        graph_ctx['static_input_ids'].copy_(input_ids)
+                        graph_ctx['static_attention_mask'].copy_(attention_mask)
+                        graph_ctx['static_labels'].copy_(labels)
+                        graph_ctx['graph'].replay()
+                        loss = graph_ctx['loss']
+                    else:
+                        graph_ctx = None
 
-                # Backward pass
-                if use_scaler:
-                    scaler.scale(loss).backward()
-                else:
-                    loss.backward()
-                
+                if loss is None:
+                    with torch.amp.autocast(device_type=self.amp_device, enabled=use_autocast):
+                        # 🚀 Use DeepSpeed engine for forward pass - handles ZeRO-3 parameter gathering!
+                        model_for_forward = self.deepspeed_engine if (self.use_deepspeed and self.deepspeed_engine is not None) else self.model
+                        outputs = model_for_forward(
+                            input_ids=input_ids,
+                            attention_mask=attn_mask_to_use,
+                            labels=labels,
+                        )
+                        if label_smoothing > 0:
+                            logits = outputs.logits
+                            loss = F.cross_entropy(
+                                logits.view(-1, logits.size(-1)),
+                                labels.view(-1),
+                                label_smoothing=label_smoothing,
+                                ignore_index=-100,
+                            )
+                        else:
+                            loss = outputs.loss
+                        loss = loss / self.train_cfg['gradient_accumulation_steps']
+
+                    # 🚀 DeepSpeed backward - handles CPU offloading automatically!
+                    if self.use_deepspeed and self.deepspeed_engine is not None:
+                        self.deepspeed_engine.backward(loss)
+                    elif use_scaler:
+                        scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
+
                 train_loss += loss.item()
                 
                 # Gradient accumulation
                 if (step + 1) % self.train_cfg['gradient_accumulation_steps'] == 0:
-                    if use_scaler:
-                        scaler.unscale_(optimizer)
-
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        self.train_cfg['max_grad_norm']
-                    )
-                    
-                    # Record grad norm
-                    total_norm = 0.0
-                    for p in self.model.parameters():
-                        if p.grad is not None:
-                            total_norm += p.grad.data.norm(2).item() ** 2
-                    total_norm = total_norm ** 0.5
-                    epoch_grad_norms.append(total_norm)
-                    
-                    # Optimizer step
-                    if use_scaler:
-                        self._safe_scaled_step(scaler, optimizer)
-                        scaler.update()
+                    # 🚀 DeepSpeed step - handles gradient clipping, optimizer step, and CPU offload!
+                    if self.use_deepspeed and self.deepspeed_engine is not None:
+                        # DeepSpeed handles gradient clipping internally
+                        self.deepspeed_engine.step()
+                        total_norm = 0.0  # DeepSpeed handles this internally
+                        epoch_grad_norms.append(total_norm)
                         self._ema_update()
                     else:
-                        optimizer.step()
-                        self._ema_update()
-                    
-                    scheduler.step()
+                        if use_scaler:
+                            scaler.unscale_(optimizer)
+
+                        self._apply_gradient_noise(optimizer_steps)
+                        self._apply_gradient_centralization()
+
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(),
+                            self.train_cfg['max_grad_norm']
+                        )
+
+                        # Record grad norm
+                        total_norm = 0.0
+                        for p in self.model.parameters():
+                            if p.grad is not None:
+                                total_norm += p.grad.data.norm(2).item() ** 2
+                        total_norm = total_norm ** 0.5
+                        epoch_grad_norms.append(total_norm)
+
+                        # Optimizer step
+                        if use_scaler:
+                            self._safe_scaled_step(scaler, optimizer)
+                            scaler.update()
+                            self._ema_update()
+                        else:
+                            optimizer.step()
+                            self._ema_update()
+
                     optimizer_steps += 1
-                    lr_history.append(scheduler.get_last_lr()[0])
-                    optimizer.zero_grad(set_to_none=True)
+                    if swa_enabled and optimizer_steps >= swa_start_step:
+                        if swa_model is not None:
+                            swa_model.update_parameters(self.model)
+                            swa_updates += 1
+                        if swa_scheduler is not None:
+                            swa_scheduler.step()
+                            lr_history.append(swa_scheduler.get_last_lr()[0])
+                        else:
+                            lr_history.append(optimizer.param_groups[0]['lr'])
+                    else:
+                        scheduler.step()
+                        lr_history.append(scheduler.get_last_lr()[0])
+
+                    # Zero gradients for next accumulation cycle
+                    if self.use_deepspeed and self.deepspeed_engine is not None:
+                        pass  # DeepSpeed handles gradient zeroing
+                    else:
+                        optimizer.zero_grad(set_to_none=True)
                 
                 # Sample hardware if needed
                 if self.hardware_monitor.should_sample():
@@ -2239,30 +3947,51 @@ class OptimizedModelTrainer:
             if (last_step_idx + 1) % self.train_cfg['gradient_accumulation_steps'] != 0:
                 logger.info("Performing final optimizer step for leftover gradients.")
 
-                if use_scaler:
-                    scaler.unscale_(optimizer)
-
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), self.train_cfg['max_grad_norm']
-                )
-
-                total_norm = 0.0
-                for p in self.model.parameters():
-                    if p.grad is not None:
-                        total_norm += p.grad.data.norm(2).item() ** 2
-                total_norm = total_norm ** 0.5
-                epoch_grad_norms.append(total_norm)
-
-                if use_scaler:
-                    self._safe_scaled_step(scaler, optimizer)
-                    scaler.update()
+                # 🚀 DeepSpeed step for leftover gradients
+                if self.use_deepspeed and self.deepspeed_engine is not None:
+                    self.deepspeed_engine.step()
+                    total_norm = 0.0
+                    epoch_grad_norms.append(total_norm)
                 else:
-                    optimizer.step()
-            
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
+                    if use_scaler:
+                        scaler.unscale_(optimizer)
+
+                    self._apply_gradient_noise(optimizer_steps)
+                    self._apply_gradient_centralization()
+
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.train_cfg['max_grad_norm']
+                    )
+
+                    total_norm = 0.0
+                    for p in self.model.parameters():
+                        if p.grad is not None:
+                            total_norm += p.grad.data.norm(2).item() ** 2
+                    total_norm = total_norm ** 0.5
+                    epoch_grad_norms.append(total_norm)
+
+                    if use_scaler:
+                        self._safe_scaled_step(scaler, optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
+
                 optimizer_steps += 1
-                lr_history.append(scheduler.get_last_lr()[0])
+                if swa_enabled and optimizer_steps >= swa_start_step:
+                    if swa_model is not None:
+                        swa_model.update_parameters(self.model)
+                        swa_updates += 1
+                    if swa_scheduler is not None:
+                        swa_scheduler.step()
+                        lr_history.append(swa_scheduler.get_last_lr()[0])
+                    else:
+                        lr_history.append(optimizer.param_groups[0]['lr'])
+                else:
+                    scheduler.step()
+                    lr_history.append(scheduler.get_last_lr()[0])
+
+                if not (self.use_deepspeed and self.deepspeed_engine is not None):
+                    optimizer.zero_grad(set_to_none=True)
             # --- END: FIX FOR GRADIENT ACCUMULATION REMAINDER ---
             
             # Epoch stats
@@ -2319,9 +4048,10 @@ class OptimizedModelTrainer:
             
             if not np.isnan(val_loss):
                 prev_plateau_lr = optimizer.param_groups[0]['lr']
-                plateau_scheduler.step(val_loss)
-                if optimizer.param_groups[0]['lr'] < prev_plateau_lr:
-                    logger.info(f"  ↓ LR reduced to {optimizer.param_groups[0]['lr']:.2e} (ReduceLROnPlateau)")
+                if not (swa_enabled and optimizer_steps >= swa_start_step):
+                    plateau_scheduler.step(val_loss)
+                    if optimizer.param_groups[0]['lr'] < prev_plateau_lr:
+                        logger.info(f"  ↓ LR reduced to {optimizer.param_groups[0]['lr']:.2e} (ReduceLROnPlateau)")
             eval_every = self.eval_cfg.get('eval_every_n_epochs', 1)
             if eval_every and (epoch + 1) % eval_every == 0:
                 eval_result = self._run_behavioral_eval(epoch, val_metadata)
@@ -2373,6 +4103,13 @@ class OptimizedModelTrainer:
             torch.cuda.synchronize()  # Ensure all CUDA ops complete for accurate timing
             torch.cuda.empty_cache()
 
+        if swa_model is not None and swa_updates > 0:
+            try:
+                self.model.load_state_dict(swa_model.module.state_dict(), strict=False)
+                logger.info(f"📊 SWA averaged weights applied ({swa_updates} updates)")
+            except Exception as e:
+                logger.warning(f"SWA weight transfer failed; continuing with last weights: {e}")
+
         # Training complete
         total_time = time.time() - training_start
         
@@ -2409,11 +4146,13 @@ class OptimizedModelTrainer:
             ],
             'curriculum_summary': self.curriculum_summary,
             'behavioral_eval_history': self.behavioral_eval_history,
+            'dataset_stats': self.dataset_stats,
             'hardware_stats': self.hardware_monitor.stats_history,
             'hardware_summary': hardware_summary,
             'peak_gpu_memory_mb': self.hardware_monitor.peak_gpu_memory_mb,
             'peak_ram_percent': self.hardware_monitor.peak_ram_percent,
             'total_training_seconds': total_time,
+            'swa_updates': swa_updates,
         }
         
         return self.training_stats
