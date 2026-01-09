@@ -1797,6 +1797,32 @@ class OptimizedModelTrainer:
             dims = tuple(range(1, p.grad.dim()))
             p.grad.sub_(p.grad.mean(dim=dims, keepdim=True))
 
+    def _init_lookahead_state(self, k: int, alpha: float) -> None:
+        self._lookahead_enabled = True
+        self._lookahead_k = max(1, int(k))
+        self._lookahead_alpha = float(alpha)
+        self._lookahead_step = 0
+        self._lookahead_slow = {}
+        for p in self.model.parameters():
+            if p.requires_grad:
+                self._lookahead_slow[p] = p.detach().clone()
+
+    def _apply_lookahead_update(self) -> None:
+        if not getattr(self, "_lookahead_enabled", False):
+            return
+        self._lookahead_step += 1
+        if self._lookahead_step % self._lookahead_k != 0:
+            return
+        for p in self.model.parameters():
+            if not p.requires_grad:
+                continue
+            slow = self._lookahead_slow.get(p)
+            if slow is None:
+                slow = p.detach().clone()
+                self._lookahead_slow[p] = slow
+            slow.add_(p.data - slow, alpha=self._lookahead_alpha)
+            p.data.copy_(slow)
+
     def _estimate_ram_bytes(self, num_sequences: int, seq_len: int, dtype: str) -> int:
         dtype_bytes = 8 if str(dtype).lower() == "int64" else 4
         input_bytes = num_sequences * seq_len * dtype_bytes
@@ -2296,8 +2322,9 @@ class OptimizedModelTrainer:
             free_gb = free_mem / (1024**3)
             logger.info(f"Pre-model-load VRAM: {free_gb:.2f} GB / {total_mem/(1024**3):.2f} GB free")
 
-        # Check if we're using DeepSpeed with CPU offload
-        # If so, we should load model on CPU to let DeepSpeed handle GPU placement
+        # Check if we're using DeepSpeed
+        # DeepSpeed is incompatible with torch.compile, so we need to detect it early
+        use_deepspeed = False
         use_deepspeed_offload = False
         deepspeed_config_path = None
         import sys
@@ -2311,12 +2338,18 @@ class OptimizedModelTrainer:
                 import json
                 with open(deepspeed_config_path, 'r') as f:
                     ds_config = json.load(f)
+                # DeepSpeed is being used
+                use_deepspeed = True
                 zero_config = ds_config.get('zero_optimization', {})
-                if zero_config.get('stage') == 3:
+                zero_stage = zero_config.get('stage', 0)
+                logger.info(f"🔧 DeepSpeed ZeRO-{zero_stage} detected")
+
+                # Check for ZeRO-3 with CPU offload (requires special model loading)
+                if zero_stage == 3:
                     offload_params = zero_config.get('offload_param', {})
                     if offload_params.get('device') == 'cpu':
                         use_deepspeed_offload = True
-                        logger.info("🔧 DeepSpeed ZeRO-3 with CPU offload detected - loading model on CPU")
+                        logger.info("🔧 DeepSpeed ZeRO-3 with CPU offload - loading model on CPU")
             except Exception as e:
                 logger.warning(f"Could not parse DeepSpeed config: {e}")
 
@@ -2467,7 +2500,10 @@ class OptimizedModelTrainer:
         # torch.compile - ARCHITECTURE AWARE!
         # Turing: SKIP - "Not enough SMs" warning + CUDA graph conflicts = slower!
         # Ampere+: Use reduce-overhead (max-autotune CUDA graphs conflict with DeepSpeed)
-        if torch.cuda.is_available() and hasattr(torch, 'compile'):
+        # CRITICAL: Skip torch.compile when using DeepSpeed - they are incompatible!
+        if use_deepspeed:
+            logger.info("⚠️ Skipping torch.compile - incompatible with DeepSpeed")
+        elif torch.cuda.is_available() and hasattr(torch, 'compile'):
             gpu_compute_cap = torch.cuda.get_device_capability()[0] + torch.cuda.get_device_capability()[1] / 10
 
             if gpu_compute_cap < 8.0:
@@ -3531,17 +3567,27 @@ class OptimizedModelTrainer:
             logger.info("Optimizer wrapped for CPU LoRA offload (staging adapters to GPU during step)")
 
         lookahead_cfg = self.train_cfg.get('lookahead', {}) if isinstance(self.train_cfg, dict) else {}
-        if isinstance(lookahead_cfg, dict) and lookahead_cfg.get('enabled', False):
-            k = int(lookahead_cfg.get('k', 5))
-            alpha = float(lookahead_cfg.get('alpha', 0.5))
-            optimizer = LookaheadOptimizer(optimizer, k=k, alpha=alpha)
-            logger.info(f"👀 Lookahead enabled (k={k}, alpha={alpha})")
+        lookahead_enabled = bool(isinstance(lookahead_cfg, dict) and lookahead_cfg.get('enabled', False))
+        lookahead_k = int(lookahead_cfg.get('k', 5)) if lookahead_enabled else 0
+        lookahead_alpha = float(lookahead_cfg.get('alpha', 0.5)) if lookahead_enabled else 0.0
 
-        # 🚀🚀🚀 1% of 1% OPTIMIZATION: DeepSpeed ZeRO-3 with FULL CPU OFFLOAD 🚀🚀🚀
+        # Calculate scheduler parameters FIRST (needed before DeepSpeed wraps optimizer)
+        grad_accum_steps = self.train_cfg['gradient_accumulation_steps']
+        steps_per_epoch = math.ceil(len(train_loader) / grad_accum_steps)
+        total_steps = steps_per_epoch * num_epochs
+        warmup_steps = max(
+            self.train_cfg['warmup_steps_min'],
+            int(total_steps * self.train_cfg['warmup_ratio'])
+        )
+        warmup_steps = min(warmup_steps, self.train_cfg['warmup_steps_max'])
+
+        # 🚀🚀🚀 1% of 1% OPTIMIZATION: DeepSpeed ZeRO with CPU OFFLOAD 🚀🚀🚀
         # This is the KEY to fitting large contexts on 8GB GPU - offload EVERYTHING to CPU/RAM!
         self.use_deepspeed = False
         self.deepspeed_engine = None
         deepspeed_config_path = None
+        scheduler = None
+        plateau_scheduler = None
 
         import sys as _sys
         for i, arg in enumerate(_sys.argv):
@@ -3554,8 +3600,13 @@ class OptimizedModelTrainer:
                 import deepspeed
                 import json
 
-                logger.info("🔥🔥🔥 DEEPSPEED ZeRO-3 ACTIVATION 🔥🔥🔥")
+                logger.info("🔥🔥🔥 DEEPSPEED ZeRO ACTIVATION 🔥🔥🔥")
                 logger.info("Offloading model parameters, optimizer states, AND gradients to CPU!")
+
+                # Disable DeepSpeed internal timers to avoid missing attribute issues
+                os.environ.setdefault("DEEPSPEED_ENABLE_TIMERS", "0")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
                 # Load DeepSpeed config
                 with open(deepspeed_config_path, 'r') as f:
@@ -3567,17 +3618,91 @@ class OptimizedModelTrainer:
                 if ds_config.get('gradient_accumulation_steps') == 'auto':
                     ds_config['gradient_accumulation_steps'] = self.train_cfg['gradient_accumulation_steps']
 
-                # Initialize DeepSpeed engine - this wraps model, optimizer, and handles offloading
-                self.deepspeed_engine, optimizer, _, _ = deepspeed.initialize(
+                # Ensure ZeRO allows untested optimizer combos
+                zero_cfg = ds_config.setdefault('zero_optimization', {})
+                if isinstance(zero_cfg, dict):
+                    zero_cfg.pop('zero_allow_untested_optimizer', None)
+                ds_config['zero_allow_untested_optimizer'] = True
+
+                # For small GPUs (<=8GB), use ZeRO-2 with CPU offload + tiny buckets
+                if torch.cuda.is_available():
+                    total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+                else:
+                    total_mem_gb = 0
+                if total_mem_gb <= 8.5:
+                    zero_cfg['stage'] = 2
+                    zero_cfg['overlap_comm'] = False
+                    zero_cfg['contiguous_gradients'] = False
+                    zero_cfg['allgather_bucket_size'] = int(min(zero_cfg.get('allgather_bucket_size', 200000000), 5000000))
+                    zero_cfg['reduce_bucket_size'] = int(min(zero_cfg.get('reduce_bucket_size', 200000000), 5000000))
+                    zero_cfg.setdefault('offload_optimizer', {})
+                    zero_cfg['offload_optimizer'].setdefault('device', 'cpu')
+                    zero_cfg['offload_optimizer'].setdefault('pin_memory', True)
+                    zero_cfg.setdefault('offload_param', {})
+                    zero_cfg['offload_param'].setdefault('device', 'cpu')
+                    zero_cfg['offload_param'].setdefault('pin_memory', True)
+                    ds_config['train_batch_size'] = max(1, int(ds_config.get('train_batch_size', 1)))
+                    ds_config['gradient_accumulation_steps'] = max(1, int(ds_config.get('gradient_accumulation_steps', 1)))
+
+                # Create optimizer for DeepSpeed
+                wants_offload = bool(zero_cfg.get('offload_optimizer') or zero_cfg.get('offload_param'))
+                if wants_offload:
+                    try:
+                        from deepspeed.ops.adam import DeepSpeedCPUAdam
+                        ds_optimizer = DeepSpeedCPUAdam(
+                            self.model.parameters(),
+                            lr=float(self.train_cfg['base_learning_rate']),
+                            betas=(0.9, 0.999),
+                            eps=1e-8,
+                            weight_decay=float(self.train_cfg['weight_decay']),
+                        )
+                        logger.info("✓ Created DeepSpeedCPUAdam for CPU offloading")
+                    except ImportError as ie:
+                        logger.warning(f"DeepSpeedCPUAdam not available: {ie}")
+                        ds_optimizer = optimizer
+                else:
+                    ds_optimizer = optimizer
+
+                # Create scheduler BEFORE DeepSpeed wraps the optimizer
+                # (DeepSpeed's wrapped optimizer doesn't pass isinstance(Optimizer) checks)
+                scheduler = get_cosine_schedule_with_warmup(
+                    ds_optimizer,
+                    num_warmup_steps=warmup_steps,
+                    num_training_steps=total_steps,
+                )
+
+                # Add scheduler config to DeepSpeed
+                ds_config['scheduler'] = {
+                    'type': 'WarmupDecayLR',
+                    'params': {
+                        'warmup_min_lr': 0,
+                        'warmup_max_lr': float(self.train_cfg['base_learning_rate']),
+                        'warmup_num_steps': warmup_steps,
+                        'total_num_steps': total_steps,
+                    }
+                }
+
+                # Initialize DeepSpeed engine with scheduler
+                self.deepspeed_engine, optimizer, _, scheduler = deepspeed.initialize(
                     model=self.model,
-                    optimizer=optimizer,
+                    optimizer=ds_optimizer,
+                    lr_scheduler=scheduler,
                     config=ds_config,
                     dist_init_required=True,
                 )
 
-                # Replace model reference with DeepSpeed engine
+                # Replace model reference with DeepSpeed engine's module
                 self.model = self.deepspeed_engine.module
+
+                # Patch missing attributes for DeepSpeed 0.18.3 compatibility
+                for attr, val in [("engine_timers", None), ("_deepcompile_active", False)]:
+                    if not hasattr(self.deepspeed_engine, attr):
+                        setattr(self.deepspeed_engine, attr, val)
+
                 self.use_deepspeed = True
+
+                # Store reference to the wrapped optimizer for LR tracking
+                self._ds_base_optimizer = ds_optimizer
 
                 # Log memory savings
                 zero_stage = ds_config.get('zero_optimization', {}).get('stage', 0)
@@ -3587,10 +3712,8 @@ class OptimizedModelTrainer:
                 logger.info(f"✅ DeepSpeed ZeRO-{zero_stage} initialized!")
                 logger.info(f"   Optimizer offload: {offload_optimizer}")
                 logger.info(f"   Parameter offload: {offload_param}")
-                logger.info(f"   Activation checkpointing: CPU")
                 logger.info("🧠 GPU will only hold ACTIVE tensors - everything else in RAM!")
 
-                # Check RAM usage
                 import psutil
                 ram = psutil.virtual_memory()
                 logger.info(f"   RAM available: {ram.available / 1e9:.1f} GB / {ram.total / 1e9:.1f} GB")
@@ -3599,32 +3722,42 @@ class OptimizedModelTrainer:
                 logger.warning("DeepSpeed not installed - falling back to standard training")
             except Exception as e:
                 logger.error(f"DeepSpeed initialization failed: {e}")
-                logger.warning("Falling back to standard training (may OOM)")
+                import traceback
+                logger.error(f"Full traceback:\n{traceback.format_exc()}")
+                if 'ValidationError' in str(type(e)):
+                    try:
+                        if hasattr(e, 'errors'):
+                            logger.error(f"Validation error details: {e.errors()}")
+                    except:
+                        pass
+                logger.error(f"DeepSpeed config that failed:\n{json.dumps(ds_config, indent=2)}")
+                raise
 
-        grad_accum_steps = self.train_cfg['gradient_accumulation_steps']
-        steps_per_epoch = math.ceil(len(train_loader) / grad_accum_steps)
-        total_steps = steps_per_epoch * num_epochs
-        warmup_steps = max(
-            self.train_cfg['warmup_steps_min'],
-            int(total_steps * self.train_cfg['warmup_ratio'])
-        )
-        warmup_steps = min(warmup_steps, self.train_cfg['warmup_steps_max'])
-        
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=total_steps,
-        )
-        plateau_scheduler = ReduceLROnPlateau(
-            optimizer,
-            mode='min',
-            factor=self.train_cfg.get('lr_reduction_factor', 0.5),
-            patience=max(1, self.train_cfg.get('lr_plateau_patience', 2)),
-            threshold=self.train_cfg['min_delta'],
-        )
+        # Create schedulers if not using DeepSpeed (DeepSpeed handles its own scheduling)
+        if scheduler is None:
+            scheduler = get_cosine_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=warmup_steps,
+                num_training_steps=total_steps,
+            )
+        if plateau_scheduler is None and not self.use_deepspeed:
+            plateau_scheduler = ReduceLROnPlateau(
+                optimizer,
+                mode='min',
+                factor=self.train_cfg.get('lr_reduction_factor', 0.5),
+                patience=max(1, self.train_cfg.get('lr_plateau_patience', 2)),
+                threshold=self.train_cfg['min_delta'],
+            )
+
+        if lookahead_enabled:
+            self._init_lookahead_state(lookahead_k, lookahead_alpha)
+            logger.info(f"👀 Lookahead enabled (k={lookahead_k}, alpha={lookahead_alpha})")
 
         swa_cfg = self.train_cfg.get('swa', {}) if isinstance(self.train_cfg, dict) else {}
-        swa_enabled = bool(swa_cfg.get('enabled', False)) and HAS_SWA_UTILS
+        # SWA requires standard PyTorch optimizer - disable when using DeepSpeed
+        swa_enabled = bool(swa_cfg.get('enabled', False)) and HAS_SWA_UTILS and not self.use_deepspeed
+        if self.use_deepspeed and swa_cfg.get('enabled', False):
+            logger.info("📊 SWA disabled (incompatible with DeepSpeed's wrapped optimizer)")
         swa_model = None
         swa_scheduler = None
         swa_start_step = total_steps + 1
@@ -3680,6 +3813,9 @@ class OptimizedModelTrainer:
 
         graph_cfg = self.train_cfg.get('cuda_graphs', {}) if isinstance(self.train_cfg, dict) else {}
         use_cuda_graphs = bool(graph_cfg.get('enabled', False)) and torch.cuda.is_available()
+        if use_cuda_graphs and self.use_deepspeed:
+            logger.info("CUDA graphs disabled (incompatible with DeepSpeed)")
+            use_cuda_graphs = False
         if use_cuda_graphs and (use_scaler or self.train_cfg['gradient_accumulation_steps'] != 1):
             logger.info("CUDA graphs disabled (requires grad_accum=1 and no GradScaler)")
             use_cuda_graphs = False
@@ -3881,6 +4017,7 @@ class OptimizedModelTrainer:
                     if self.use_deepspeed and self.deepspeed_engine is not None:
                         # DeepSpeed handles gradient clipping internally
                         self.deepspeed_engine.step()
+                        self._apply_lookahead_update()
                         total_norm = 0.0  # DeepSpeed handles this internally
                         epoch_grad_norms.append(total_norm)
                         self._ema_update()
@@ -3912,6 +4049,7 @@ class OptimizedModelTrainer:
                         else:
                             optimizer.step()
                             self._ema_update()
+                        self._apply_lookahead_update()
 
                     optimizer_steps += 1
                     if swa_enabled and optimizer_steps >= swa_start_step:
@@ -3950,6 +4088,7 @@ class OptimizedModelTrainer:
                 # 🚀 DeepSpeed step for leftover gradients
                 if self.use_deepspeed and self.deepspeed_engine is not None:
                     self.deepspeed_engine.step()
+                    self._apply_lookahead_update()
                     total_norm = 0.0
                     epoch_grad_norms.append(total_norm)
                 else:
@@ -3975,6 +4114,7 @@ class OptimizedModelTrainer:
                         scaler.update()
                     else:
                         optimizer.step()
+                    self._apply_lookahead_update()
 
                 optimizer_steps += 1
                 if swa_enabled and optimizer_steps >= swa_start_step:
@@ -4046,7 +4186,7 @@ class OptimizedModelTrainer:
             logger.info(f"  LR: {current_lr:.2e}")
             logger.info(f"  Time: {epoch_time:.1f}s")
             
-            if not np.isnan(val_loss):
+            if not np.isnan(val_loss) and plateau_scheduler is not None:
                 prev_plateau_lr = optimizer.param_groups[0]['lr']
                 if not (swa_enabled and optimizer_steps >= swa_start_step):
                     plateau_scheduler.step(val_loss)

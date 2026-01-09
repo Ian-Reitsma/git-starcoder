@@ -3,18 +3,21 @@ extreme_optimizations:
   activation_4bit_type: nf4
   dynamic_curriculum_enabled: true
   dynamic_curriculum_schedule: &id002
-  - batch_size: 8
+  - batch_size: 16
     context: 8192
-    epochs: 1-2
-  - batch_size: 4
+    epochs: 1-1
+  - batch_size: 8
     context: 16384
-    epochs: 3-5
-  - batch_size: 2
+    epochs: 2-3
+  - batch_size: 4
     context: 32768
-    epochs: 6-9
-  - batch_size: 1
+    epochs: 4-5
+  - batch_size: 2
     context: 65536
-    epochs: 10-15
+    epochs: 6-7
+  - batch_size: 1
+    context: 131072
+    epochs: 8-13
   fused_kernels_backend: triton
   fused_kernels_enabled: true
   gqa_enabled: true
@@ -44,7 +47,7 @@ quantization:
   bnb_4bit_compute_dtype: bfloat16
   bnb_4bit_quant_type: nf4
   bnb_4bit_use_double_quant: true
-  context_window: 65536
+  context_window: 131072
   load_in_4bit: true
   load_in_8bit: false
   lora_alpha: 176
@@ -59,7 +62,7 @@ quantization:
   - k_proj
   - v_proj
   - dense
-  target_window: 8192
+  target_window: 16384
 system:
   allow_tf32: true
   cpu_affinity: auto
@@ -127,7 +130,7 @@ training:
     pct_start: 0.3
     type: one_cycle
   lr_scheduler_type: one_cycle
-  max_grad_norm: 0.9
+  max_grad_norm: 0.8
   memory_mapped_dataset: &id007
     cache_dir: null
     checksum_bytes: 4194304
@@ -1196,10 +1199,10 @@ ultra_optimizations:
   - 998000
   - 999000
   dynamic_context_curriculum:
-    description: 'Dynamic curriculum: 4 stages over 15 epochs'
+    description: 'Dynamic curriculum: 5 stages over 13 epochs'
     enabled: true
-    final_context: 65536
-    num_stages: 4
+    final_context: 131072
+    num_stages: 5
     schedule: *id002
     speedup: 1.4
   early_stopping:
